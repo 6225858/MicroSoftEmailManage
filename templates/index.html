@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>邮箱管理后台</title>
+    <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+    <div class="page-shell app-shell">
+        <aside class="sidebar">
+            <div class="brand-block">
+                <p class="eyebrow">Hotmail Mail Manager</p>
+                <h1>邮箱管理后台</h1>
+                <p class="muted">本地部署的简约版管理系统</p>
+            </div>
+
+            <nav class="menu-list">
+                <button class="menu-item is-active" type="button" data-view="accounts">账号管理</button>
+                <button class="menu-item" type="button" data-view="mails">邮件查看</button>
+                <button class="menu-item" type="button" data-view="logs">日志</button>
+            </nav>
+
+            <div class="sidebar-footer">
+                <span id="account-count" class="pill">0 个账号</span>
+                <button id="logout-btn" class="button button-ghost" type="button">退出登录</button>
+            </div>
+        </aside>
+
+        <main class="content-shell">
+            <header class="topbar">
+                <div>
+                    <p class="eyebrow">控制台</p>
+                    <h2 id="view-title">账号管理</h2>
+                </div>
+                <div class="topbar-actions">
+                    <button id="toggle-auto-refresh-btn" class="button button-ghost" type="button">开启自动刷新</button>
+                    <button id="refresh-accounts-btn" class="button button-ghost" type="button">刷新账号</button>
+                </div>
+            </header>
+
+            <section class="view-panel is-visible" data-panel="accounts">
+                <div class="content-grid content-grid-accounts">
+                    <section class="panel">
+                        <div class="panel-head">
+                            <div>
+                                <h3>批量导入邮箱</h3>
+                                <p class="muted">每行一个账号，格式：邮箱----密码----clientid----refresh_token</p>
+                            </div>
+                        </div>
+
+                        <div class="stack gap-sm">
+                            <textarea id="import-input" class="textarea textarea-lg" placeholder="示例：&#10;abc@hotmail.com----123456----clientidxxxx----refresh_token_xxx"></textarea>
+                            <div class="action-row">
+                                <button id="import-btn" class="button" type="button">开始导入</button>
+                            </div>
+                            <p id="import-message" class="message"></p>
+                        </div>
+                    </section>
+
+                    <section class="panel">
+                        <div class="panel-head">
+                            <div>
+                                <h3>邮箱列表</h3>
+                                <p class="muted">支持按邮箱搜索和标签筛选，并可直接修改标签</p>
+                            </div>
+                        </div>
+
+                        <div class="stack gap-sm">
+                            <div class="filter-row">
+                                <input id="search-input" class="input" type="text" placeholder="搜索邮箱">
+                                <select id="tag-filter" class="input filter-select">
+                                    <option value="">全部标签</option>
+                                    <option value="__NO_TAG__">无标签</option>
+                                </select>
+                            </div>
+                            <p id="account-filter-summary" class="filter-summary">当前显示 0 / 总计 0 个邮箱</p>
+                            <div id="account-list" class="account-list"></div>
+                        </div>
+                    </section>
+
+                    <section class="panel">
+                        <div class="panel-head">
+                            <div>
+                                <h3>账号详情</h3>
+                                <p class="muted">选中左侧账号后，可维护标签并跳转查看邮件</p>
+                            </div>
+                        </div>
+
+                        <div class="stack gap-md">
+                            <div class="info-card">
+                                <span class="info-label">当前账号</span>
+                                <strong id="selected-email">请选择邮箱账号</strong>
+                            </div>
+
+                            <div class="info-card">
+                                <span class="info-label">当前备注</span>
+                                <div id="selected-remark" class="remark-content">暂无备注</div>
+                            </div>
+
+                            <div class="stack gap-sm">
+                                <label class="field-label" for="tags-input">标签</label>
+                                <input id="tags-input" class="input" type="text" placeholder="多个标签请用逗号分隔">
+                                <div class="action-row">
+                                    <button id="save-tags-btn" class="button" type="button">保存标签</button>
+                                    <button id="open-mails-btn" class="button button-ghost" type="button">查看该账号邮件</button>
+                                </div>
+                            </div>
+
+                            <div class="stack gap-sm">
+                                <label class="field-label" for="remark-input">备注</label>
+                                <textarea id="remark-input" class="textarea remark-input" placeholder="填写这个邮箱的用途、来源或注意事项"></textarea>
+                                <div class="action-row">
+                                    <button id="save-remark-btn" class="button" type="button">保存备注</button>
+                                </div>
+                                <p id="account-message" class="message"></p>
+                            </div>
+                        </div>
+                    </section>
+                </div>
+            </section>
+
+            <section class="view-panel" data-panel="mails">
+                <div class="mobile-mail-steps" aria-label="移动端邮件查看步骤">
+                    <button class="mobile-mail-step is-active" data-mail-step-target="accounts" type="button">邮箱账号</button>
+                    <button class="mobile-mail-step" data-mail-step-target="list" type="button">邮件列表</button>
+                    <button class="mobile-mail-step" data-mail-step-target="detail" type="button">邮件正文</button>
+                </div>
+
+                <div class="content-grid content-grid-mails">
+                    <section class="panel mail-step-panel is-mobile-active" data-mail-step="accounts">
+                        <div class="panel-head">
+                            <div>
+                                <h3>选择邮箱</h3>
+                                <p class="muted">先按邮箱搜索或按标签筛选，再选择要查看邮件的账号</p>
+                            </div>
+                        </div>
+
+                        <div class="stack gap-sm">
+                            <div class="filter-row">
+                                <input id="mail-search-input" class="input" type="text" placeholder="搜索邮箱">
+                                <select id="mail-tag-filter" class="input filter-select">
+                                    <option value="">全部标签</option>
+                                    <option value="__NO_TAG__">无标签</option>
+                                </select>
+                            </div>
+                            <p id="mail-filter-summary" class="filter-summary">当前显示 0 / 总计 0 个邮箱</p>
+                            <div id="mail-account-list" class="account-list"></div>
+                        </div>
+                    </section>
+
+                    <section class="panel mail-step-panel" data-mail-step="list">
+                        <div class="panel-head panel-head-stack">
+                            <div>
+                                <h3 id="mail-panel-title">请选择邮箱</h3>
+                                <p class="muted">支持查看收件箱和垃圾箱</p>
+                            </div>
+                            <button class="button button-ghost mobile-step-back" data-mail-step-target="accounts" type="button">返回邮箱账号</button>
+                            <div id="mail-account-remark" class="mail-account-remark">暂无备注</div>
+                            <div class="mail-toolbar">
+                                <div class="tab-row">
+                                    <button class="tab is-active" data-folder="inbox" type="button">收件箱</button>
+                                    <button class="tab" data-folder="junk" type="button">垃圾箱</button>
+                                </div>
+                                <button id="copy-mail-address-btn" class="button button-ghost" type="button">复制邮箱地址</button>
+                            </div>
+                        </div>
+
+                        <p id="mail-message" class="message"></p>
+                        <div id="mail-list" class="mail-list empty-state">请选择一个邮箱账号后查看邮件</div>
+                    </section>
+
+                    <section class="panel mail-step-panel" data-mail-step="detail">
+                        <div class="panel-head">
+                            <div>
+                                <h3>邮件正文</h3>
+                                <p class="muted">点击中间邮件列表即可预览正文</p>
+                            </div>
+                            <div class="mail-detail-actions">
+                                <button class="button button-ghost mobile-step-back" data-mail-step-target="list" type="button">返回邮件列表</button>
+                                <span id="auto-refresh-state" class="pill">未开启自动刷新</span>
+                            </div>
+                        </div>
+                        <article id="mail-detail" class="mail-detail empty-state">
+                            请选择一封邮件查看内容
+                        </article>
+                    </section>
+                </div>
+            </section>
+
+            <section class="view-panel" data-panel="logs">
+                <div class="content-grid content-grid-logs">
+                    <section class="panel">
+                        <div class="panel-head panel-head-stack">
+                            <div>
+                                <h3>刷新口令日志</h3>
+                                <p class="muted">每日凌晨 3 点自动执行，也可以在这里手动触发一次全量刷新任务</p>
+                            </div>
+                            <div class="logs-toolbar">
+                                <button id="refresh-log-run-btn" class="button" type="button">手动触发任务</button>
+                            </div>
+                            <div class="logs-pagination-bar">
+                                <label class="logs-pagination-field">
+                                    <span class="field-label">页码</span>
+                                    <select id="refresh-log-page" class="input filter-select"></select>
+                                </label>
+                                <label class="logs-pagination-field">
+                                    <span class="field-label">每页条数</span>
+                                    <select id="refresh-log-page-size" class="input filter-select">
+                                        <option value="10" selected>10</option>
+                                        <option value="30">30</option>
+                                        <option value="50">50</option>
+                                    </select>
+                                </label>
+                                <p id="refresh-log-pagination-summary" class="filter-summary"></p>
+                            </div>
+                        </div>
+
+                        <p id="refresh-log-message" class="message"></p>
+                        <div id="refresh-log-list" class="refresh-log-list"></div>
+                    </section>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <div id="tag-modal" class="modal-shell" hidden>
+        <div id="tag-modal-backdrop" class="modal-backdrop"></div>
+        <section class="modal-card" role="dialog" aria-modal="true" aria-labelledby="tag-modal-title">
+            <div class="modal-head">
+                <div>
+                    <p class="eyebrow">Tag Editor</p>
+                    <h3 id="tag-modal-title">设置邮箱标签</h3>
+                    <p class="muted">给常看的邮箱加上业务标签，搜索和筛选都会更顺手。</p>
+                </div>
+                <button id="tag-modal-close-btn" class="icon-button" type="button" aria-label="关闭标签编辑弹窗">×</button>
+            </div>
+
+            <div class="modal-account-card">
+                <span class="info-label">当前邮箱</span>
+                <strong id="tag-modal-email" class="tag-modal-email">-</strong>
+                <div id="tag-modal-current-tags" class="tag-row tag-modal-current-tags"></div>
+            </div>
+
+            <div class="stack gap-sm">
+                <label class="field-label" for="tag-modal-input">标签内容</label>
+                <textarea
+                    id="tag-modal-input"
+                    class="textarea tag-modal-textarea"
+                    placeholder="例如：注册号，站点A，重点关注"
+                ></textarea>
+                <div class="modal-hint-row">
+                    <span>多个标签请用逗号分隔，支持中英文逗号</span>
+                    <span>Ctrl + Enter 快速保存</span>
+                </div>
+            </div>
+
+            <div class="stack gap-sm">
+                <span class="field-label">效果预览</span>
+                <div id="tag-modal-preview" class="tag-modal-preview"></div>
+            </div>
+
+            <div class="stack gap-sm">
+                <span class="field-label">快速填写</span>
+                <div id="tag-modal-suggestions" class="tag-modal-suggestions"></div>
+            </div>
+
+            <p id="tag-modal-message" class="message modal-message"></p>
+
+            <div class="modal-actions">
+                <button id="tag-modal-cancel-btn" class="button button-ghost" type="button">取消</button>
+                <button id="tag-modal-save-btn" class="button" type="button">保存标签</button>
+            </div>
+        </section>
+    </div>
+
+    <div id="remark-modal" class="modal-shell" hidden>
+        <div id="remark-modal-backdrop" class="modal-backdrop"></div>
+        <section class="modal-card" role="dialog" aria-modal="true" aria-labelledby="remark-modal-title">
+            <div class="modal-head">
+                <div>
+                    <p class="eyebrow">Remark Editor</p>
+                    <h3 id="remark-modal-title">设置邮箱备注</h3>
+                    <p class="muted">给邮箱补充说明信息，方便后续快速判断用途和来源。</p>
+                </div>
+                <button id="remark-modal-close-btn" class="icon-button" type="button" aria-label="关闭备注编辑弹窗">×</button>
+            </div>
+
+            <div class="modal-account-card">
+                <span class="info-label">当前邮箱</span>
+                <strong id="remark-modal-email" class="tag-modal-email">-</strong>
+                <div id="remark-modal-current" class="remark-content remark-modal-current">暂无备注</div>
+            </div>
+
+            <div class="stack gap-sm">
+                <label class="field-label" for="remark-modal-input">备注内容</label>
+                <textarea
+                    id="remark-modal-input"
+                    class="textarea tag-modal-textarea"
+                    placeholder="例如：注册站点、用途说明、异常情况、来源渠道"
+                ></textarea>
+                <div class="modal-hint-row">
+                    <span>支持多行输入</span>
+                    <span>Ctrl + Enter 快速保存</span>
+                </div>
+            </div>
+
+            <p id="remark-modal-message" class="message modal-message"></p>
+
+            <div class="modal-actions">
+                <button id="remark-modal-cancel-btn" class="button button-ghost" type="button">取消</button>
+                <button id="remark-modal-save-btn" class="button" type="button">保存备注</button>
+            </div>
+        </section>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>

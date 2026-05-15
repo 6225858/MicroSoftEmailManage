@@ -1,0 +1,1229 @@
+:root {
+    --bg: #f5f1e8;
+    --panel: rgba(255, 251, 245, 0.94);
+    --sidebar: #2f5148;
+    --sidebar-soft: rgba(255, 255, 255, 0.12);
+    --line: #ddd2c1;
+    --text: #2f2a24;
+    --muted: #7a7064;
+    --accent: #c96b3b;
+    --accent-dark: #a9562d;
+    --accent-soft: #f3dfd2;
+    --success-soft: #dcebe5;
+    --danger: #b64d3b;
+    --shadow: 0 20px 50px rgba(61, 47, 33, 0.12);
+}
+
+* {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+    color: var(--text);
+    background:
+        radial-gradient(circle at top left, rgba(201, 107, 59, 0.13), transparent 24%),
+        radial-gradient(circle at right, rgba(47, 81, 72, 0.12), transparent 26%),
+        linear-gradient(180deg, #f6f1e7 0%, #eee4d4 100%);
+    font-family: "Microsoft YaHei", "PingFang SC", "Segoe UI", sans-serif;
+    height: 100vh;
+    overflow: hidden;
+}
+
+body.modal-open {
+    overflow: hidden;
+}
+
+[hidden] {
+    display: none !important;
+}
+
+.login-body {
+    min-height: 100vh;
+    display: grid;
+    place-items: center;
+    padding: 24px;
+}
+
+.login-shell {
+    width: min(1440px, calc(100vw - 32px));
+    display: grid;
+    place-items: center;
+}
+
+.login-card,
+.panel,
+.topbar,
+.sidebar {
+    border: 1px solid rgba(221, 210, 193, 0.9);
+    box-shadow: var(--shadow);
+}
+
+.login-card,
+.panel,
+.topbar {
+    backdrop-filter: blur(18px);
+    background: var(--panel);
+}
+
+.login-card {
+    width: min(480px, 100%);
+    padding: 36px;
+    border-radius: 24px;
+}
+
+.app-shell {
+    display: grid;
+    grid-template-columns: 236px 1fr;
+    gap: 22px;
+    height: 100vh;
+    padding: 16px;
+    overflow: hidden;
+}
+
+.sidebar {
+    background:
+        linear-gradient(180deg, rgba(255, 255, 255, 0.08), transparent),
+        var(--sidebar);
+    color: #fff;
+    border-radius: 28px;
+    padding: 26px 22px;
+    display: flex;
+    flex-direction: column;
+    height: calc(100vh - 32px);
+    overflow: hidden;
+}
+
+.sidebar .muted,
+.sidebar .eyebrow {
+    color: rgba(255, 255, 255, 0.7);
+}
+
+.brand-block {
+    margin-bottom: 28px;
+}
+
+.menu-list {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.menu-item {
+    width: 100%;
+    padding: 14px 16px;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 18px;
+    background: transparent;
+    color: #fff;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+    transition: background 0.18s ease, transform 0.18s ease;
+}
+
+.menu-item:hover,
+.menu-item.is-active {
+    background: var(--sidebar-soft);
+    transform: translateY(-1px);
+}
+
+.sidebar-footer {
+    margin-top: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.content-shell {
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+    height: calc(100vh - 32px);
+    overflow: hidden;
+}
+
+.topbar {
+    border-radius: 24px;
+    padding: 22px 24px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 16px;
+}
+
+.topbar-actions,
+.panel-head,
+.tab-row,
+.action-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+
+.view-panel {
+    display: none;
+}
+
+.view-panel.is-visible {
+    display: block;
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
+}
+
+.content-grid {
+    display: grid;
+    gap: 18px;
+    height: 100%;
+}
+
+.content-grid-accounts {
+    grid-template-columns: 1.1fr 1fr 0.9fr;
+}
+
+.content-grid-mails {
+    grid-template-columns: 300px 460px minmax(0, 1fr);
+}
+
+.content-grid-logs {
+    grid-template-columns: minmax(0, 1fr);
+}
+
+.panel {
+    border-radius: 24px;
+    padding: 20px;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    overflow: hidden;
+}
+
+.panel-head {
+    justify-content: space-between;
+    margin-bottom: 16px;
+}
+
+.panel-head-stack {
+    flex-direction: column;
+    align-items: stretch;
+}
+
+.stack {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-height: 0;
+}
+
+.gap-sm {
+    gap: 10px;
+}
+
+.gap-md {
+    gap: 16px;
+}
+
+.eyebrow {
+    margin: 0 0 8px;
+    font-size: 12px;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+}
+
+h1,
+h2,
+h3,
+p {
+    margin-top: 0;
+}
+
+h1 {
+    margin-bottom: 8px;
+    font-size: 30px;
+}
+
+h2 {
+    margin-bottom: 0;
+    font-size: 28px;
+}
+
+h3 {
+    margin-bottom: 6px;
+    font-size: 20px;
+}
+
+.muted,
+.field-label,
+.message,
+time,
+.mail-item span,
+.info-label {
+    color: var(--muted);
+}
+
+.input,
+.textarea,
+.button,
+.tab,
+.account-item,
+.mail-item {
+    border-radius: 16px;
+    font: inherit;
+}
+
+.input,
+.textarea {
+    width: 100%;
+    padding: 8px 14px;
+    background: rgba(255, 255, 255, 0.88);
+    border: 1px solid var(--line);
+}
+
+.filter-select {
+    cursor: pointer;
+}
+
+.textarea {
+    min-height: 180px;
+    resize: vertical;
+}
+
+.textarea-lg {
+    min-height: 300px;
+}
+
+.button,
+.tab {
+    cursor: pointer;
+    padding: 11px 16px;
+    border: none;
+    background: var(--accent);
+    color: #fff;
+    transition: transform 0.16s ease, background 0.16s ease;
+}
+
+.button:hover,
+.tab:hover,
+.account-item:hover,
+.mail-item:hover {
+    transform: translateY(-1px);
+}
+
+.button:hover,
+.tab.is-active {
+    background: var(--accent-dark);
+}
+
+.button:disabled,
+.tab:disabled {
+    cursor: not-allowed;
+    opacity: 0.6;
+    transform: none;
+}
+
+.button-ghost,
+.tab {
+    background: var(--accent-soft);
+    color: var(--accent-dark);
+    border: 1px solid rgba(201, 107, 59, 0.12);
+}
+
+.pill,
+.tag {
+    display: inline-flex;
+    align-items: center;
+    border-radius: 999px;
+    padding: 6px 10px;
+    font-size: 12px;
+}
+
+.pill {
+    background: var(--success-soft);
+    color: #2f6d59;
+}
+
+.sidebar .pill {
+    background: rgba(255, 255, 255, 0.14);
+    color: #fff;
+}
+
+.tag {
+    background: #efe5d6;
+    color: #665646;
+}
+
+.account-list,
+.mail-list {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    flex: 1;
+    min-height: 0;
+    overflow: auto;
+}
+
+.account-item,
+.mail-item {
+    width: 100%;
+    min-width: 0;
+    text-align: left;
+    padding: 14px;
+    border: 1px solid var(--line);
+    background: rgba(255, 255, 255, 0.75);
+}
+
+.account-item-active,
+.mail-item-active {
+    border-color: var(--accent);
+    background: #fff4ec;
+}
+
+.account-item-shell {
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    border: 1px solid var(--line);
+    border-radius: 16px;
+    background: rgba(255, 255, 255, 0.75);
+    padding: 14px;
+}
+
+.account-item-shell.account-item-active {
+    border-color: var(--accent);
+    background: #fff4ec;
+}
+
+.account-item-shell .account-item {
+    display: block;
+    min-height: fit-content;
+    line-height: 1.5;
+    white-space: normal;
+    overflow: visible;
+    padding: 0;
+    border: none;
+    background: transparent;
+}
+
+.account-item-email {
+    display: block;
+    line-height: 1.45;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+}
+
+.account-item-meta {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-top: 10px;
+}
+
+.account-meta-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+.account-tag-button {
+    flex-shrink: 0;
+    white-space: nowrap;
+    border: 1px solid rgba(201, 107, 59, 0.18);
+    background: rgba(201, 107, 59, 0.12);
+    color: var(--accent-dark);
+    padding: 8px 12px;
+    border-radius: 999px;
+    font: inherit;
+    font-size: 12px;
+    font-weight: 700;
+    cursor: pointer;
+    transition: background 0.16s ease, color 0.16s ease, transform 0.16s ease;
+}
+
+.account-tag-button:hover {
+    background: var(--accent);
+    color: #fff;
+    transform: translateY(-1px);
+}
+
+.tag-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    flex: 1;
+    min-height: 20px;
+}
+
+.remark-content,
+.mail-account-remark {
+    white-space: pre-wrap;
+    line-height: 1.6;
+    word-break: break-word;
+}
+
+.remark-input {
+    min-height: 120px;
+}
+
+.filter-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 120px;
+    gap: 10px;
+}
+
+.filter-summary {
+    margin: -2px 2px 2px;
+    color: var(--muted);
+    font-size: 13px;
+}
+
+.modal-shell {
+    position: fixed;
+    inset: 0;
+    z-index: 1000;
+    display: grid;
+    place-items: center;
+    padding: 24px;
+}
+
+.modal-backdrop {
+    position: absolute;
+    inset: 0;
+    background: rgba(34, 28, 24, 0.48);
+    backdrop-filter: blur(10px);
+    opacity: 0;
+    transition: opacity 0.18s ease;
+}
+
+.modal-card {
+    position: relative;
+    width: min(560px, calc(100vw - 32px));
+    max-height: min(760px, calc(100vh - 32px));
+    overflow: auto;
+    border-radius: 28px;
+    border: 1px solid rgba(221, 210, 193, 0.9);
+    background:
+        radial-gradient(circle at top right, rgba(201, 107, 59, 0.18), transparent 26%),
+        linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(248, 241, 231, 0.95));
+    box-shadow: 0 30px 80px rgba(42, 33, 24, 0.24);
+    padding: 24px;
+    transform: translateY(18px) scale(0.98);
+    opacity: 0;
+    transition: transform 0.18s ease, opacity 0.18s ease;
+}
+
+.modal-shell.is-visible .modal-backdrop,
+.modal-shell.is-visible .modal-card {
+    opacity: 1;
+}
+
+.modal-shell.is-visible .modal-card {
+    transform: translateY(0) scale(1);
+}
+
+.modal-head,
+.modal-actions,
+.modal-hint-row {
+    display: flex;
+    align-items: center;
+}
+
+.modal-head {
+    justify-content: space-between;
+    gap: 16px;
+    margin-bottom: 18px;
+}
+
+.icon-button {
+    width: 40px;
+    height: 40px;
+    border: 1px solid rgba(201, 107, 59, 0.16);
+    border-radius: 999px;
+    background: rgba(201, 107, 59, 0.08);
+    color: var(--accent-dark);
+    font: inherit;
+    font-size: 24px;
+    line-height: 1;
+    cursor: pointer;
+    transition: transform 0.16s ease, background 0.16s ease, color 0.16s ease;
+}
+
+.icon-button:hover {
+    background: var(--accent);
+    color: #fff;
+    transform: translateY(-1px);
+}
+
+.modal-account-card {
+    border: 1px solid rgba(221, 210, 193, 0.9);
+    border-radius: 22px;
+    background: rgba(255, 255, 255, 0.78);
+    padding: 18px;
+    margin-bottom: 18px;
+}
+
+.tag-modal-email {
+    display: block;
+    margin-top: 6px;
+    font-size: 18px;
+    line-height: 1.45;
+    word-break: break-all;
+}
+
+.tag-modal-current-tags {
+    margin-top: 12px;
+    min-height: 28px;
+}
+
+.tag-modal-textarea {
+    min-height: 120px;
+}
+
+.modal-hint-row {
+    justify-content: space-between;
+    gap: 12px;
+    color: var(--muted);
+    font-size: 12px;
+}
+
+.tag-modal-preview {
+    min-height: 72px;
+    padding: 14px;
+    border-radius: 18px;
+    border: 1px dashed rgba(201, 107, 59, 0.28);
+    background: rgba(201, 107, 59, 0.06);
+    display: flex;
+    align-content: flex-start;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.tag-modal-chip {
+    background: #f6d9c9;
+    color: #7b3f21;
+}
+
+.tag-modal-suggestions {
+    min-height: 56px;
+    padding: 12px;
+    border-radius: 18px;
+    border: 1px solid rgba(47, 81, 72, 0.14);
+    background: rgba(47, 81, 72, 0.05);
+    display: flex;
+    align-content: flex-start;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.tag-suggestion-button {
+    border: 1px solid rgba(47, 81, 72, 0.18);
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.88);
+    color: var(--accent-dark);
+    font: inherit;
+    font-size: 13px;
+    font-weight: 600;
+    padding: 7px 12px;
+    cursor: pointer;
+    transition: transform 0.18s ease, border-color 0.18s ease, background 0.18s ease;
+}
+
+.tag-suggestion-button:hover {
+    transform: translateY(-1px);
+    border-color: rgba(201, 107, 59, 0.42);
+    background: rgba(255, 246, 239, 0.96);
+}
+
+.tag-suggestion-button.is-active {
+    border-color: rgba(201, 107, 59, 0.42);
+    background: #f6d9c9;
+    color: #7b3f21;
+}
+
+.modal-message {
+    margin: 14px 0 0;
+}
+
+.modal-actions {
+    justify-content: flex-end;
+    gap: 12px;
+    margin-top: 8px;
+}
+
+.remark-modal-current {
+    margin-top: 12px;
+    min-height: 28px;
+}
+
+.mail-account-remark {
+    padding: 12px 14px;
+    border-radius: 18px;
+    border: 1px solid rgba(47, 81, 72, 0.12);
+    background: rgba(47, 81, 72, 0.06);
+}
+
+.mail-toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 12px;
+}
+
+.mobile-mail-steps,
+.mail-detail-actions {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+
+.logs-toolbar,
+.logs-pagination-bar,
+.logs-pagination-field,
+.refresh-log-card-head,
+.refresh-log-failure,
+.refresh-log-time {
+    display: flex;
+}
+
+.logs-toolbar {
+    justify-content: flex-start;
+}
+
+.logs-pagination-bar {
+    align-items: flex-end;
+    gap: 12px;
+    flex-wrap: wrap;
+}
+
+.logs-pagination-field {
+    flex-direction: column;
+    gap: 8px;
+    min-width: 140px;
+}
+
+.refresh-log-list {
+    display: grid;
+    gap: 14px;
+    flex: 1;
+    min-height: 0;
+    overflow: auto;
+    padding-right: 2px;
+}
+
+.refresh-log-card {
+    border: 1px solid rgba(47, 81, 72, 0.14);
+    border-radius: 22px;
+    background:
+        radial-gradient(circle at top right, rgba(201, 107, 59, 0.12), transparent 26%),
+        rgba(255, 255, 255, 0.88);
+    padding: 18px 20px;
+    box-shadow: 0 10px 26px rgba(61, 47, 33, 0.08);
+}
+
+.refresh-log-card.is-success {
+    border-color: rgba(47, 109, 89, 0.22);
+}
+
+.refresh-log-card.is-partial {
+    border-color: rgba(182, 77, 59, 0.2);
+}
+
+.refresh-log-card-head {
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 12px;
+    flex-wrap: wrap;
+}
+
+.refresh-log-card h3 {
+    margin-bottom: 12px;
+}
+
+.refresh-log-duration {
+    color: var(--muted);
+    font-size: 13px;
+}
+
+.refresh-log-failures {
+    display: grid;
+    gap: 10px;
+    margin-bottom: 14px;
+}
+
+.refresh-log-failure {
+    flex-direction: column;
+    gap: 4px;
+    padding: 12px 14px;
+    border-radius: 16px;
+    background: rgba(47, 81, 72, 0.05);
+    border: 1px solid rgba(47, 81, 72, 0.1);
+    line-height: 1.6;
+    word-break: break-word;
+}
+
+.refresh-log-failure.is-empty {
+    color: var(--muted);
+}
+
+.refresh-log-time {
+    align-items: center;
+    gap: 8px;
+    color: var(--muted);
+    font-size: 13px;
+    flex-wrap: wrap;
+}
+
+.refresh-log-actions {
+    margin-top: 14px;
+    display: flex;
+    justify-content: flex-end;
+}
+
+.refresh-log-preview-btn {
+    min-width: 132px;
+}
+
+.mobile-mail-steps {
+    display: none;
+}
+
+.mobile-mail-step,
+.mobile-step-back {
+    display: none;
+}
+
+.mobile-mail-step {
+    flex: 1;
+    padding: 10px 12px;
+    border: 1px solid rgba(201, 107, 59, 0.16);
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.82);
+    color: var(--accent-dark);
+    font: inherit;
+    font-weight: 700;
+    cursor: pointer;
+    transition: background 0.16s ease, color 0.16s ease, border-color 0.16s ease;
+}
+
+.mobile-mail-step.is-active {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #fff;
+}
+
+.mobile-mail-step:disabled {
+    cursor: not-allowed;
+    opacity: 0.5;
+}
+
+.tab-row {
+    flex-wrap: wrap;
+}
+
+.mail-toolbar .tab,
+.mail-toolbar .button-ghost {
+    font-weight: 700;
+}
+
+.mail-toolbar .tab.is-active {
+    color: #fff;
+}
+
+.mail-item {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.mail-detail {
+    border-radius: 20px;
+    background: rgba(255, 255, 255, 0.8);
+    border: 1px solid rgba(221, 210, 193, 0.9);
+    flex: 1;
+    min-height: 0;
+    padding: 18px;
+    overflow: auto;
+    display: flex;
+    flex-direction: column;
+}
+
+.info-card {
+    border-radius: 20px;
+    background: rgba(255, 255, 255, 0.8);
+    border: 1px solid rgba(221, 210, 193, 0.9);
+}
+
+.info-card {
+    padding: 18px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.mail-detail-head {
+    padding-bottom: 12px;
+    margin-bottom: 18px;
+    border-bottom: 1px solid var(--line);
+    flex-shrink: 0;
+}
+
+.mail-detail-body {
+    flex: 1;
+    min-height: 0;
+}
+
+.mail-detail-body iframe {
+    width: 100%;
+    height: 100%;
+    border: none;
+    background: #fff;
+    border-radius: 8px;
+}
+
+.empty-state {
+    display: grid;
+    place-items: center;
+    color: var(--muted);
+    min-height: 180px;
+    text-align: center;
+}
+
+.message {
+    min-height: 20px;
+}
+
+.message.is-error {
+    color: var(--danger);
+}
+
+@media (max-width: 1280px) {
+    .content-grid-accounts,
+    .content-grid-mails {
+        grid-template-columns: 1fr;
+    }
+
+    .panel,
+    .mail-detail {
+        min-height: auto;
+    }
+}
+
+@media (max-width: 980px) {
+    body {
+        height: auto;
+        min-height: 100vh;
+        overflow: auto;
+    }
+
+    .app-shell {
+        grid-template-columns: 1fr;
+        gap: 10px;
+        height: auto;
+        min-height: 100vh;
+        padding: 10px;
+        overflow: visible;
+    }
+
+    .sidebar {
+        min-height: auto;
+        height: auto;
+        border-radius: 18px;
+        padding: 16px 14px;
+    }
+
+    .account-item-meta {
+        align-items: flex-start;
+    }
+
+    .account-meta-actions {
+        width: 100%;
+    }
+
+    .content-shell,
+    .content-grid,
+    .view-panel.is-visible {
+        height: auto;
+        overflow: visible;
+    }
+
+    .content-shell {
+        gap: 10px;
+    }
+
+    .content-grid-mails .mail-step-panel {
+        display: none;
+    }
+
+    .content-grid-mails .mail-step-panel.is-mobile-active {
+        display: flex;
+    }
+
+    .topbar,
+    .panel {
+        border-radius: 18px;
+        padding: 16px;
+    }
+
+    .mail-detail,
+    .info-card {
+        border-radius: 16px;
+        padding: 14px;
+    }
+
+    .panel-head {
+        margin-bottom: 12px;
+    }
+
+    .filter-row {
+        grid-template-columns: 1fr;
+    }
+
+    .topbar,
+    .topbar-actions,
+    .action-row,
+    .mail-toolbar,
+    .logs-toolbar,
+    .logs-pagination-bar {
+        align-items: stretch;
+    }
+
+    .topbar-actions,
+    .action-row,
+    .logs-toolbar {
+        width: 100%;
+        flex-wrap: wrap;
+    }
+
+    .mobile-mail-steps {
+        display: flex;
+        gap: 8px;
+    }
+
+    .mobile-mail-step,
+    .mobile-step-back {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+    }
+
+    .topbar-actions .button,
+    .topbar-actions .button-ghost,
+    .action-row .button,
+    .action-row .button-ghost,
+    .mail-toolbar .button,
+    .mail-toolbar .button-ghost,
+    .logs-toolbar .button,
+    .logs-pagination-field {
+        width: 100%;
+    }
+
+    .account-list,
+    .mail-list {
+        overflow: visible;
+    }
+
+    .mail-detail-actions {
+        width: 100%;
+        justify-content: space-between;
+        flex-wrap: wrap;
+        gap: 10px;
+    }
+
+    .mail-detail-body iframe {
+        min-height: 56vh;
+        height: 56vh;
+    }
+
+    .modal-shell {
+        padding: 12px;
+    }
+
+    .modal-card {
+        width: 100%;
+        padding: 20px;
+    }
+
+    .modal-head,
+    .modal-hint-row,
+    .modal-actions {
+        align-items: stretch;
+        flex-direction: column;
+    }
+
+    .modal-actions .button,
+    .modal-actions .button-ghost {
+        width: 100%;
+    }
+}
+
+@media (max-width: 640px) {
+    .login-body,
+    .login-shell,
+    .modal-shell {
+        padding: 8px;
+    }
+
+    .login-card {
+        padding: 20px;
+        border-radius: 18px;
+    }
+
+    .app-shell {
+        gap: 6px;
+        padding: 6px;
+    }
+
+    .sidebar,
+    .topbar,
+    .panel,
+    .modal-card {
+        border-radius: 14px;
+    }
+
+    .sidebar,
+    .topbar,
+    .panel,
+    .modal-card,
+    .modal-account-card,
+    .mail-detail,
+    .info-card {
+        padding: 12px;
+    }
+
+    .content-shell,
+    .content-grid {
+        gap: 6px;
+    }
+
+    .brand-block {
+        margin-bottom: 16px;
+    }
+
+    .menu-list,
+    .sidebar-footer,
+    .tab-row,
+    .mail-toolbar,
+    .modal-actions,
+    .mail-detail-actions,
+    .logs-pagination-bar,
+    .refresh-log-list {
+        gap: 8px;
+    }
+
+    h1 {
+        font-size: 24px;
+    }
+
+    h2 {
+        font-size: 22px;
+    }
+
+    h3 {
+        font-size: 18px;
+    }
+
+    .eyebrow {
+        margin-bottom: 6px;
+        letter-spacing: 0.12em;
+    }
+
+    .menu-item,
+    .button,
+    .tab,
+    .input,
+    .textarea,
+    .account-item,
+    .mail-item {
+        border-radius: 12px;
+    }
+
+    .menu-item,
+    .button,
+    .tab {
+        padding: 10px 12px;
+    }
+
+    .input,
+    .textarea {
+        padding: 8px 12px;
+    }
+
+    .textarea {
+        min-height: 140px;
+    }
+
+    .textarea-lg {
+        min-height: 220px;
+    }
+
+    .account-item-shell,
+    .account-item,
+    .mail-item {
+        padding: 12px;
+    }
+
+    .account-item-meta {
+        gap: 8px;
+        margin-top: 8px;
+    }
+
+    .account-meta-actions {
+        width: 100%;
+        gap: 8px;
+    }
+
+    .account-tag-button {
+        width: 100%;
+        padding: 8px 10px;
+    }
+
+    .mobile-mail-steps {
+        gap: 6px;
+    }
+
+    .mobile-mail-step {
+        padding: 9px 8px;
+        font-size: 13px;
+    }
+
+    .mobile-step-back {
+        width: 100%;
+    }
+
+    .mail-detail-head {
+        padding-bottom: 10px;
+        margin-bottom: 12px;
+    }
+
+    .mail-detail-body iframe {
+        min-height: 50vh;
+        height: 50vh;
+    }
+
+    .icon-button {
+        width: 36px;
+        height: 36px;
+        font-size: 22px;
+    }
+
+    .modal-account-card {
+        margin-bottom: 12px;
+    }
+
+    .tag-modal-preview {
+        min-height: 56px;
+        padding: 10px;
+        border-radius: 12px;
+    }
+
+    .modal-hint-row {
+        gap: 8px;
+        font-size: 11px;
+    }
+}

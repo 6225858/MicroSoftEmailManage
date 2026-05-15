@@ -1,0 +1,73 @@
+import time
+import logging
+
+import requests
+from sqlalchemy.orm import Session
+
+from models import MailAccount, MailRefreshTokenHistory
+
+
+TOKEN_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
+TOKEN_CACHE_SECONDS = 30 * 60
+
+
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    logger.addHandler(handler)
+logger.setLevel(logging.INFO)
+logger.propagate = False
+
+
+class OAuthServiceError(Exception):
+    pass
+
+
+def get_valid_access_token(account: MailAccount, db: Session) -> str:
+    now = int(time.time())
+    if account.cached_access_token and account.access_token_expire_time > now:
+        return account.cached_access_token
+
+    old_refresh_token = account.refresh_token
+    response = requests.post(
+        TOKEN_URL,
+        data={
+            "client_id": account.client_id,
+            "grant_type": "refresh_token",
+            "refresh_token": old_refresh_token,
+        },
+        timeout=20,
+    )
+    response.raise_for_status()
+    payload = response.json()
+
+    if payload.get("error"):
+        raise OAuthServiceError(payload.get("error_description") or payload["error"])
+
+    access_token = payload.get("access_token")
+    if not access_token:
+        raise OAuthServiceError("token response missing access_token")
+
+    new_refresh_token = str(payload.get("refresh_token") or "").strip()
+    if new_refresh_token:
+        logger.info("邮箱 %s 收到新的 refresh_token，开始更新数据库并记录历史 refresh_token", account.email)
+        if old_refresh_token:
+            db.add(
+                MailRefreshTokenHistory(
+                    mail_account_id=account.id,
+                    old_refresh_token=old_refresh_token,
+                    update_time=now,
+                )
+            )
+            logger.info("邮箱 %s 的旧 refresh_token 已写入历史记录表", account.email)
+        else:
+            logger.info("邮箱 %s 当前没有旧 refresh_token，跳过历史记录写入", account.email)
+        account.refresh_token = new_refresh_token
+        logger.info("邮箱 %s 的 refresh_token 已更新为新值", account.email)
+
+    account.cached_access_token = access_token
+    account.access_token_expire_time = now + TOKEN_CACHE_SECONDS
+    db.commit()
+    db.refresh(account)
+    return access_token

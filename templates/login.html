@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>邮箱管理后台登录</title>
+    <link rel="stylesheet" href="/static/app.css">
+</head>
+<body class="login-body">
+    <main class="login-shell">
+        <section class="login-card">
+            <p class="eyebrow">Hotmail Mail Manager</p>
+            <h1>邮箱管理后台</h1>
+            <p class="muted">请输入后台密码后登录系统。</p>
+            <form id="login-form" class="stack gap-md">
+                <input id="password" class="input" type="password" placeholder="请输入后台密码" autocomplete="current-password">
+                <button class="button" type="submit">登录后台</button>
+                <p id="login-message" class="message"></p>
+            </form>
+        </section>
+    </main>
+    <script>
+        const form = document.getElementById("login-form");
+        const message = document.getElementById("login-message");
+
+        form.addEventListener("submit", async (event) => {
+            event.preventDefault();
+            message.textContent = "";
+
+            const password = document.getElementById("password").value.trim();
+            const response = await fetch("/login", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ password })
+            });
+
+            if (!response.ok) {
+                message.textContent = "密码错误，请重新输入。";
+                return;
+            }
+
+            const data = await response.json();
+            localStorage.setItem("mail_manager_token", data.token);
+            window.location.href = "/dashboard";
+        });
+    </script>
+</body>
+</html>

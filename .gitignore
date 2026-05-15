@@ -1,0 +1,4 @@
+.idea
+mail.db
+__pycache__
+.env*
