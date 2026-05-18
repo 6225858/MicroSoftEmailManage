@@ -1,11 +1,13 @@
 import os
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Optional
+from urllib.parse import quote
 
 import uvicorn
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
@@ -201,6 +203,34 @@ def import_accounts(body: ImportBody, db: Session = Depends(get_db)):
 
     db.commit()
     return {"inserted": inserted, "updated": updated, "skipped": skipped}
+
+
+@app.get("/api/accounts/export", dependencies=[Depends(require_token)])
+def export_accounts(db: Session = Depends(get_db)):
+    accounts = db.query(MailAccount).order_by(MailAccount.id.asc()).all()
+    lines = [
+        "----".join(
+            [
+                (account.email or "").replace("\r", " ").replace("\n", " "),
+                (account.password or "").replace("\r", " ").replace("\n", " "),
+                (account.client_id or "").replace("\r", " ").replace("\n", " "),
+                (account.refresh_token or "").replace("\r", " ").replace("\n", " "),
+            ]
+        )
+        for account in accounts
+    ]
+    content = "\n".join(lines)
+    now = datetime.now()
+    timestamp = now.strftime("%Y年%m月%d日%H时%M分%S秒")
+    filename = f"emailToken{timestamp}.txt"
+    fallback_filename = f"emailToken{now.strftime('%Y%m%d%H%M%S')}.txt"
+    headers = {
+        "Content-Disposition": (
+            f'attachment; filename="{fallback_filename}"; '
+            f"filename*=UTF-8''{quote(filename)}"
+        )
+    }
+    return Response(content=content, media_type="text/plain; charset=utf-8", headers=headers)
 
 
 @app.post("/api/accounts/{account_id}/tags", dependencies=[Depends(require_token)])

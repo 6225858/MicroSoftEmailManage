@@ -41,6 +41,7 @@ const elements = {
     accountMessage: document.getElementById("account-message"),
     autoRefreshState: document.getElementById("auto-refresh-state"),
     copyMailAddressBtn: document.getElementById("copy-mail-address-btn"),
+    exportAccountsBtn: document.getElementById("export-accounts-btn"),
     importBtn: document.getElementById("import-btn"),
     importInput: document.getElementById("import-input"),
     importMessage: document.getElementById("import-message"),
@@ -126,6 +127,8 @@ const text = {
     chooseAccountFirst: "请先选择邮箱账号",
     importInputRequired: "请先粘贴导入内容",
     importFinished: (data) => `导入完成：新增 ${data.inserted}，更新 ${data.updated}，跳过 ${data.skipped}`,
+    exportingAccounts: "正在导出账号...",
+    exportAccountsSuccess: "账号导出成功，文件已开始下载",
     saveTagsSuccess: "标签保存成功",
     promptTagsTitle: "请输入标签，多个标签请用逗号分隔",
     tagPreviewEmpty: "输入后会在这里实时预览标签效果",
@@ -399,7 +402,26 @@ function updateAutoRefreshUi() {
 
 function updateViewActions() {
     elements.toggleAutoRefreshBtn.hidden = state.currentView !== "mails";
+    elements.exportAccountsBtn.hidden = state.currentView !== "accounts";
     elements.refreshAccountsBtn.hidden = state.currentView !== "accounts";
+}
+
+function getDownloadFileNameFromDisposition(disposition) {
+    if (!disposition) {
+        return "emailToken.txt";
+    }
+
+    const utf8Match = disposition.match(/filename\*=UTF-8''([^;]+)/i);
+    if (utf8Match) {
+        try {
+            return decodeURIComponent(utf8Match[1]);
+        } catch (error) {
+            return utf8Match[1];
+        }
+    }
+
+    const plainMatch = disposition.match(/filename="?([^"]+)"?/i);
+    return plainMatch ? plainMatch[1] : "emailToken.txt";
 }
 
 function normalizeMailMobileStep(step) {
@@ -985,6 +1007,46 @@ async function importAccounts() {
     }
 }
 
+async function exportAccounts() {
+    setMessage(elements.accountMessage, text.exportingAccounts, false);
+    elements.exportAccountsBtn.disabled = true;
+
+    try {
+        const response = await fetch("/api/accounts/export", {
+            headers: {
+                "X-Token": state.token
+            }
+        });
+
+        if (response.status === 401) {
+            localStorage.removeItem("mail_manager_token");
+            window.location.href = "/";
+            throw new Error(text.loginExpired);
+        }
+
+        if (!response.ok) {
+            const data = await response.json().catch(() => ({}));
+            throw new Error(data.detail || text.requestFailed);
+        }
+
+        const blob = await response.blob();
+        const downloadUrl = URL.createObjectURL(blob);
+        const anchor = document.createElement("a");
+        anchor.href = downloadUrl;
+        anchor.download = getDownloadFileNameFromDisposition(response.headers.get("content-disposition"));
+        document.body.appendChild(anchor);
+        anchor.click();
+        anchor.remove();
+        URL.revokeObjectURL(downloadUrl);
+
+        setMessage(elements.accountMessage, text.exportAccountsSuccess, false);
+    } catch (error) {
+        setMessage(elements.accountMessage, error.message || text.requestFailed, true);
+    } finally {
+        elements.exportAccountsBtn.disabled = false;
+    }
+}
+
 async function saveTags() {
     if (!state.selectedAccountId) {
         setMessage(elements.accountMessage, text.chooseAccountFirst, true);
@@ -1348,6 +1410,7 @@ function toggleAutoRefresh() {
 }
 
 elements.importBtn.addEventListener("click", importAccounts);
+elements.exportAccountsBtn.addEventListener("click", exportAccounts);
 elements.refreshAccountsBtn.addEventListener("click", () => loadAccounts());
 elements.refreshLogRunBtn.addEventListener("click", triggerTokenRefreshTask);
 elements.saveTagsBtn.addEventListener("click", saveTags);
