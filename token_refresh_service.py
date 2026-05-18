@@ -329,6 +329,8 @@ def _run_token_refresh_job_with_lock(trigger_type: str = "manual") -> TokenRefre
     logger.info("Starting token refresh job, trigger type: %s", trigger_label)
 
     with SessionLocal() as db:
+        # The refresh job should always scan the full mailbox list without
+        # filtering by valid_status, then update that status from the result.
         accounts = db.query(MailAccount).order_by(MailAccount.id.asc()).all()
         started_at = int(time.time())
         failures = []
@@ -340,6 +342,8 @@ def _run_token_refresh_job_with_lock(trigger_type: str = "manual") -> TokenRefre
             logger.info("Refreshing account %d/%d: %s", index, total_count, account.email)
             try:
                 items = load_account_mails(account, db, folder="inbox", limit=1)
+                account.valid_status = 1
+                db.commit()
                 success_count += 1
 
                 latest_mail = items[0] if items else None
@@ -370,6 +374,8 @@ def _run_token_refresh_job_with_lock(trigger_type: str = "manual") -> TokenRefre
 
                 logger.info("Refresh succeeded for account %d/%d: %s", index, total_count, account.email)
             except MailServiceError as exc:
+                account.valid_status = 0
+                db.commit()
                 failures.append(
                     {
                         "email": account.email,

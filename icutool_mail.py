@@ -84,6 +84,9 @@ def ensure_mail_account_schema() -> None:
         columns = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(mail_account)").fetchall()}
         if "remark" not in columns:
             conn.exec_driver_sql("ALTER TABLE mail_account ADD COLUMN remark TEXT NOT NULL DEFAULT ''")
+        if "valid_status" not in columns:
+            conn.exec_driver_sql("ALTER TABLE mail_account ADD COLUMN valid_status INTEGER NOT NULL DEFAULT 1")
+        conn.exec_driver_sql("UPDATE mail_account SET valid_status = 1 WHERE valid_status IS NULL")
 
 
 def ensure_token_refresh_log_schema() -> None:
@@ -191,6 +194,7 @@ def import_accounts(body: ImportBody, db: Session = Depends(get_db)):
                 access_token_expire_time=0,
                 tags="",
                 remark="",
+                valid_status=1,
                 created_at=now,
             )
             db.add(account)

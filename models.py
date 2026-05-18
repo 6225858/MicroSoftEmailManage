@@ -15,6 +15,7 @@ class MailAccount(Base):
     access_token_expire_time = Column(Integer, default=0, nullable=False)
     tags = Column(Text, default="", nullable=False)
     remark = Column(Text, default="", nullable=False)
+    valid_status = Column(Integer, default=1, nullable=False)
     created_at = Column(Integer, nullable=False)
 
 
