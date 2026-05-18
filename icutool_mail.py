@@ -211,7 +211,12 @@ def import_accounts(body: ImportBody, db: Session = Depends(get_db)):
 
 @app.get("/api/accounts/export", dependencies=[Depends(require_token)])
 def export_accounts(db: Session = Depends(get_db)):
-    accounts = db.query(MailAccount).order_by(MailAccount.id.asc()).all()
+    accounts = (
+        db.query(MailAccount)
+        .filter(MailAccount.valid_status != 0)
+        .order_by(MailAccount.id.asc())
+        .all()
+    )
     lines = [
         "----".join(
             [
