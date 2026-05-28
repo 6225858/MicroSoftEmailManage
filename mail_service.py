@@ -1,6 +1,8 @@
 import email
 import html
 import imaplib
+import base64
+import binascii
 import re
 from email.header import decode_header, make_header
 from email.utils import parsedate_to_datetime
@@ -41,6 +43,94 @@ def _add_tag(account: MailAccount, tag: str) -> None:
 
 def _generate_auth_string(email_name: str, access_token: str) -> str:
     return f"user={email_name}\1auth=Bearer {access_token}\1\1"
+
+
+def _decode_modified_utf7(value: bytes) -> str:
+    text = value.decode("ascii", errors="ignore")
+    output = []
+    index = 0
+
+    while index < len(text):
+        if text[index] != "&":
+            output.append(text[index])
+            index += 1
+            continue
+
+        end_index = text.find("-", index)
+        if end_index == -1:
+            output.append(text[index:])
+            break
+
+        encoded = text[index + 1 : end_index]
+        if not encoded:
+            output.append("&")
+        else:
+            padding = "=" * (-len(encoded) % 4)
+            try:
+                output.append(base64.b64decode((encoded + padding).replace(",", "/")).decode("utf-16-be"))
+            except (binascii.Error, UnicodeDecodeError):
+                output.append(text[index : end_index + 1])
+
+        index = end_index + 1
+
+    return "".join(output)
+
+
+def _encode_modified_utf7(value: str) -> bytes:
+    output = []
+    buffer = []
+
+    def flush_buffer() -> None:
+        if not buffer:
+            return
+        encoded = base64.b64encode("".join(buffer).encode("utf-16-be")).decode("ascii")
+        output.append("&" + encoded.rstrip("=").replace("/", ",") + "-")
+        buffer.clear()
+
+    for char in value:
+        codepoint = ord(char)
+        if char == "&":
+            flush_buffer()
+            output.append("&-")
+        elif 0x20 <= codepoint <= 0x7E:
+            flush_buffer()
+            output.append(char)
+        else:
+            buffer.append(char)
+
+    flush_buffer()
+    return "".join(output).encode("ascii")
+
+
+def _quote_mailbox_name(value: bytes) -> bytes:
+    return b'"' + value.replace(b"\\", b"\\\\").replace(b'"', b'\\"') + b'"'
+
+
+def _parse_list_item(item: bytes) -> tuple[bytes, str, str]:
+    text = item.strip()
+    flags_match = re.match(rb"\((?P<flags>[^)]*)\)", text)
+    flags = flags_match.group("flags").decode("ascii", errors="ignore").lower() if flags_match else ""
+
+    if text.endswith(b'"'):
+        index = len(text) - 2
+        escaped = False
+        start_index = -1
+        while index >= 0:
+            char = text[index : index + 1]
+            if char == b'"' and not escaped:
+                start_index = index
+                break
+            escaped = char == b"\\" and not escaped
+            if char != b"\\":
+                escaped = False
+            index -= 1
+
+        raw_name = text[start_index + 1 : -1] if start_index >= 0 else text
+        raw_name = raw_name.replace(b'\\"', b'"').replace(b"\\\\", b"\\")
+    else:
+        raw_name = text.rsplit(maxsplit=1)[-1]
+
+    return raw_name, _decode_modified_utf7(raw_name), flags
 
 
 def _decode_header(value: str | None) -> str:
@@ -136,23 +226,25 @@ def _select_folder(mail_client: imaplib.IMAP4_SSL, folder: str) -> None:
         if result != "OK":
             raise MailServiceError("failed to list folders")
 
-        folder_names = []
-        for item in folders:
-            text = item.decode("utf-8", errors="ignore")
-            folder_names.append(text.split(' "/" ')[-1].strip('"'))
+        folder_names = [_parse_list_item(item) for item in folders or []]
 
         target_folder = next(
-            (name for name in folder_names if any(key.lower() in name.lower() for key in JUNK_CANDIDATES)),
+            (
+                raw_name
+                for raw_name, display_name, flags in folder_names
+                if "\\junk" in flags or any(key.lower() in display_name.lower() for key in JUNK_CANDIDATES)
+            ),
             None,
         )
         if not target_folder:
             raise MailServiceError("junk folder not found")
     else:
-        target_folder = "Inbox"
+        target_folder = _encode_modified_utf7("Inbox")
 
-    result, _ = mail_client.select(target_folder)
+    result, _ = mail_client.select(_quote_mailbox_name(target_folder))
     if result != "OK":
-        raise MailServiceError(f"failed to open folder: {target_folder}")
+        display_name = _decode_modified_utf7(target_folder)
+        raise MailServiceError(f"failed to open folder: {display_name}")
 
 
 def load_mail_messages(
