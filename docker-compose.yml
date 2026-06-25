@@ -1,0 +1,14 @@
+services:
+  mail-manager:
+    build: .
+    container_name: ms-email-manager
+    ports:
+      - "10019:10019"
+    environment:
+      - ADMIN_PASSWORD=admin123
+    volumes:
+      - mail-data:/app
+    restart: unless-stopped
+
+volumes:
+  mail-data:

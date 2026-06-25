@@ -317,6 +317,92 @@ def load_mail_messages(
         raise MailServiceError(f"imap login failed: {exc}") from exc
 
 
+def list_account_folders(
+    account: MailAccount,
+    db: Session,
+) -> list[dict[str, str]]:
+    """获取邮箱的所有文件夹列表"""
+    try:
+        access_token = get_valid_access_token(account, db)
+    except HTTPError as exc:
+        raise MailServiceError(f"token refresh failed: {exc}", tag="token_invalid") from exc
+    except OAuthServiceError as exc:
+        raise MailServiceError(f"token refresh failed: {exc}", tag="token_invalid") from exc
+
+    try:
+        mail = imaplib.IMAP4_SSL(IMAP_HOST)
+        mail.authenticate(
+            "XOAUTH2",
+            lambda _: _generate_auth_string(account.email, access_token),
+        )
+        result, folders = mail.list()
+        if result != "OK":
+            raise MailServiceError("failed to list folders")
+
+        items = []
+        for item in folders or []:
+            raw_name, display_name, flags = _parse_list_item(item)
+            items.append({
+                "name": display_name,
+                "raw_name": raw_name.decode("utf-8", errors="ignore"),
+                "flags": flags,
+            })
+        mail.logout()
+        return items
+    except imaplib.IMAP4.error as exc:
+        raise MailServiceError(f"imap login failed: {exc}") from exc
+
+
+def load_single_mail(
+    account: MailAccount,
+    db: Session,
+    mail_id: str,
+    folder: str = "inbox",
+) -> dict | None:
+    """获取单封邮件的完整内容（含所有头部和正文）"""
+    try:
+        access_token = get_valid_access_token(account, db)
+    except HTTPError as exc:
+        raise MailServiceError(f"token refresh failed: {exc}", tag="token_invalid") from exc
+    except OAuthServiceError as exc:
+        raise MailServiceError(f"token refresh failed: {exc}", tag="token_invalid") from exc
+
+    try:
+        mail = imaplib.IMAP4_SSL(IMAP_HOST)
+        mail.authenticate(
+            "XOAUTH2",
+            lambda _: _generate_auth_string(account.email, access_token),
+        )
+        _select_folder(mail, folder)
+        fetch_result, msg_data = mail.fetch(mail_id.encode(), "(RFC822)")
+        if fetch_result != "OK" or not msg_data or not msg_data[0]:
+            mail.logout()
+            return None
+
+        raw_email = msg_data[0][1]
+        message = email.message_from_bytes(raw_email)
+        try:
+            mail_dt = _format_mail_datetime(message["Date"])
+        except Exception:
+            mail_dt = ""
+
+        result = {
+            "id": mail_id,
+            "subject": _decode_header(message.get("Subject")),
+            "mail_from": _decode_header(message.get("From")).replace("<", "(").replace(">", ")"),
+            "mail_to": _decode_header(message.get("To")).replace("<", "(").replace(">", ")"),
+            "cc": _decode_header(message.get("Cc")).replace("<", "(").replace(">", ")") if message.get("Cc") else "",
+            "bcc": _decode_header(message.get("Bcc")).replace("<", "(").replace(">", ")") if message.get("Bcc") else "",
+            "reply_to": _decode_header(message.get("Reply-To")).replace("<", "(").replace(">", ")") if message.get("Reply-To") else "",
+            "mail_dt": mail_dt,
+            "body": _extract_body(message),
+        }
+        mail.logout()
+        return result
+    except imaplib.IMAP4.error as exc:
+        raise MailServiceError(f"imap login failed: {exc}") from exc
+
+
 def load_account_mails(
     account: MailAccount,
     db: Session,

@@ -15,7 +15,7 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from database import Base, SessionLocal, engine
-from mail_service import MailServiceError, load_account_mails
+from mail_service import MailServiceError, load_account_mails, list_account_folders, load_single_mail
 from models import MailAccount, TokenRefreshLog
 from token_refresh_service import (
     ALLOWED_PAGE_SIZES,
@@ -25,7 +25,6 @@ from token_refresh_service import (
     start_token_refresh_scheduler,
     stop_token_refresh_scheduler,
 )
-
 
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
 
@@ -68,7 +67,7 @@ def require_preview_token(token: Optional[str] = Query(default=None)):
 
 def normalize_tags(tags: str) -> str:
     seen = []
-    for item in tags.replace("\uff0c", ",").split(","):
+    for item in tags.replace("，", ",").split(","):
         value = item.strip()
         if value and value not in seen:
             seen.append(value)
@@ -268,6 +267,7 @@ def update_remark(account_id: int, body: RemarkBody, db: Session = Depends(get_d
 def get_account_mails(
     account_id: int,
     folder: str = Query(default="inbox"),
+    limit: int = Query(default=20, ge=1, le=100),
     db: Session = Depends(get_db),
 ):
     account = db.query(MailAccount).filter(MailAccount.id == account_id).first()
@@ -275,8 +275,44 @@ def get_account_mails(
         raise HTTPException(status_code=404, detail="account not found")
 
     try:
-        items = load_account_mails(account, db, folder=folder, limit=20)
+        items = load_account_mails(account, db, folder=folder, limit=limit)
         return {"items": items}
+    except MailServiceError as exc:
+        raise HTTPException(status_code=400, detail=exc.message)
+
+
+@app.get("/api/accounts/{account_id}/folders", dependencies=[Depends(require_token)])
+def get_account_folders(
+    account_id: int,
+    db: Session = Depends(get_db),
+):
+    account = db.query(MailAccount).filter(MailAccount.id == account_id).first()
+    if account is None:
+        raise HTTPException(status_code=404, detail="account not found")
+
+    try:
+        folders = list_account_folders(account, db)
+        return {"items": folders}
+    except MailServiceError as exc:
+        raise HTTPException(status_code=400, detail=exc.message)
+
+
+@app.get("/api/accounts/{account_id}/mails/{mail_id}", dependencies=[Depends(require_token)])
+def get_account_mail_detail(
+    account_id: int,
+    mail_id: str,
+    folder: str = Query(default="inbox"),
+    db: Session = Depends(get_db),
+):
+    account = db.query(MailAccount).filter(MailAccount.id == account_id).first()
+    if account is None:
+        raise HTTPException(status_code=404, detail="account not found")
+
+    try:
+        mail_detail = load_single_mail(account, db, mail_id=mail_id, folder=folder)
+        if mail_detail is None:
+            raise HTTPException(status_code=404, detail="mail not found")
+        return mail_detail
     except MailServiceError as exc:
         raise HTTPException(status_code=400, detail=exc.message)
 
