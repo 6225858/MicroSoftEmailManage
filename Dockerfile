@@ -1,4 +1,6 @@
-FROM python:3.11-slim
+# 使用国内镜像加速前缀拉取基础镜像，避免 Docker Hub 在国内被墙
+ARG REGISTRY=docker.m.daocloud.io
+FROM ${REGISTRY}/library/python:3.11-slim
 
 WORKDIR /app
 
@@ -9,7 +11,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Install Python dependencies
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements.txt
 
 # Copy application code
 COPY . .
