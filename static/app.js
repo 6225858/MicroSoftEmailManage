@@ -242,6 +242,7 @@ const elements = {
     settingsReleaseNotes: document.getElementById("settings-release-notes"),
     settingsReleaseLink: document.getElementById("settings-release-link"),
     settingsUpdateMessage: document.getElementById("settings-update-message"),
+    settingsPerformUpdateBtn: document.getElementById("settings-perform-update-btn"),
     remarkInput: document.getElementById("remark-input"),
     saveTagsBtn: document.getElementById("save-tags-btn"),
     saveRemarkBtn: document.getElementById("save-remark-btn"),
@@ -2988,6 +2989,11 @@ async function checkForUpdate() {
             }
         }
 
+        // 一键更新按钮:仅在有新版本时显示
+        if (elements.settingsPerformUpdateBtn) {
+            elements.settingsPerformUpdateBtn.hidden = !hasUpdate;
+        }
+
         // 顶部消息
         const message = hasUpdate
             ? text.settingsHasUpdate(latest)
@@ -3007,10 +3013,49 @@ async function checkForUpdate() {
     }
 }
 
+async function performUpdate() {
+    if (!window.confirm("确认要自动下载并更新到最新版本吗？\n\n更新过程中服务会短暂不可用，更新完成后需要手动重启服务。")) {
+        return;
+    }
+
+    elements.settingsPerformUpdateBtn.disabled = true;
+    elements.settingsPerformUpdateBtn.textContent = "正在下载并更新…";
+    setMessage(elements.settingsUpdateMessage, "正在下载最新版本并应用更新，请耐心等待…", false);
+    if (elements.settingsCheckStatus) {
+        elements.settingsCheckStatus.textContent = "更新中（可能需要 1-2 分钟）…";
+    }
+
+    try {
+        const result = await api("/api/perform-update", { method: "POST" });
+
+        if (result.ok) {
+            elements.settingsPerformUpdateBtn.hidden = true;
+            setMessage(
+                elements.settingsUpdateMessage,
+                `${result.message || "更新完成"}\n旧版本: ${result.previous_version || "?"} → 新版本: ${result.latest_version || "?"}\n\n请重启服务使更新生效。`,
+                false
+            );
+            if (elements.settingsCheckStatus) {
+                elements.settingsCheckStatus.textContent = "更新完成，请重启服务";
+            }
+        } else {
+            setMessage(elements.settingsUpdateMessage, result.error || "更新失败", true);
+        }
+    } catch (error) {
+        setMessage(elements.settingsUpdateMessage, error.message, true);
+    } finally {
+        elements.settingsPerformUpdateBtn.disabled = false;
+        elements.settingsPerformUpdateBtn.textContent = "一键更新到新版本";
+    }
+}
+
 // 设置页面事件绑定
 if (elements.settingsSaveRepoBtn) {
     elements.settingsSaveRepoBtn.addEventListener("click", saveGithubRepo);
 }
 if (elements.settingsCheckUpdateBtn) {
     elements.settingsCheckUpdateBtn.addEventListener("click", checkForUpdate);
+}
+if (elements.settingsPerformUpdateBtn) {
+    elements.settingsPerformUpdateBtn.addEventListener("click", performUpdate);
 }

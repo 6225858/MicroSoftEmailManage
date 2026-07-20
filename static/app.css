@@ -1099,6 +1099,31 @@ time,
     border: 1px solid var(--border);
 }
 
+/* 一键更新绿色按钮 */
+.button-success {
+    background: linear-gradient(135deg, #10b981 0%, #059669 100%);
+    color: #fff;
+    border-color: transparent;
+    box-shadow: 0 4px 12px rgba(16, 185, 129, 0.30), 0 8px 24px rgba(16, 185, 129, 0.18);
+}
+
+.button-success::before {
+    background: linear-gradient(180deg, rgba(255, 255, 255, 0.22) 0%, transparent 100%);
+}
+
+.button-success:hover:not(:disabled) {
+    filter: brightness(1.05);
+    box-shadow: 0 6px 16px rgba(16, 185, 129, 0.36), 0 12px 28px rgba(16, 185, 129, 0.22);
+}
+
+.button-success:disabled {
+    cursor: not-allowed;
+    opacity: 0.5;
+    transform: none;
+    filter: grayscale(0.3);
+    box-shadow: var(--shadow-sm);
+}
+
 @keyframes pulse-glow {
     0%, 100% { box-shadow: 0 2px 8px rgba(16, 185, 129, 0.3); }
     50% { box-shadow: 0 2px 16px rgba(16, 185, 129, 0.5); }

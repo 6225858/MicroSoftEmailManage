@@ -1247,5 +1247,179 @@ def save_settings_api(body: SettingsBody):
     return {"ok": True, "github_repo": github_repo}
 
 
+@app.post("/api/perform-update", dependencies=[Depends(require_api_key)])
+def perform_update():
+    """下载 GitHub Release 源码 zip 并覆盖项目文件,实现一键自动更新。
+
+    流程:
+    1. 获取最新 release 的 zipball_url
+    2. 下载源码 zip 到临时文件
+    3. 解压,跳过顶层目录(GitHub zipball 格式)
+    4. 备份需要保留的本地数据(settings.json/mail.db/data/等)
+    5. 用新文件覆盖项目目录
+    6. 恢复备份的本地数据
+    7. 返回更新结果,前端提示用户重启服务
+    """
+    import tempfile
+    import zipfile
+    import shutil
+
+    settings = load_settings()
+    github_repo = (settings.get("github_repo") or "").strip()
+    if not github_repo:
+        raise HTTPException(status_code=400, detail="未配置 GitHub 仓库地址，请先在设置中填写")
+
+    github_repo = github_repo.replace("https://github.com/", "").replace("http://github.com/", "").strip("/")
+    if github_repo.count("/") != 1:
+        raise HTTPException(status_code=400, detail="GitHub 仓库地址格式不正确")
+
+    # 需要保留的本地数据文件和目录(更新时不能覆盖)
+    PRESERVE_FILES = ["settings.json", "mail.db", ".env", ".env.local", ".env.production"]
+    PRESERVE_DIRS = ["data", "logs"]
+    PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+    try:
+        # 1. 获取最新 release 信息
+        release_resp = requests.get(
+            f"https://api.github.com/repos/{github_repo}/releases/latest",
+            timeout=15,
+            headers={
+                "Accept": "application/vnd.github+json",
+                "User-Agent": "MicroSoftEmailManage-UpdateChecker",
+            },
+        )
+        if release_resp.status_code == 404:
+            raise HTTPException(status_code=404, detail="GitHub 上尚未发布任何 release")
+        release_resp.raise_for_status()
+        release_data = release_resp.json()
+
+        latest_version = (release_data.get("tag_name") or "").lstrip("vV")
+        if compare_versions(latest_version, APP_VERSION) <= 0:
+            return {"ok": False, "error": "当前已是最新版本", "current_version": APP_VERSION, "latest_version": latest_version}
+
+        # 2. 下载源码 zip(GitHub zipball_url 总是可用,不依赖 Release 附件)
+        zipball_url = release_data.get("zipball_url") or f"https://github.com/{github_repo}/archive/refs/tags/{release_data.get('tag_name', '')}.zip"
+
+        logger.info("开始下载更新: %s (v%s)", zipball_url, latest_version)
+        zip_resp = requests.get(
+            zipball_url,
+            timeout=120,
+            stream=True,
+            headers={"User-Agent": "MicroSoftEmailManage-UpdateChecker"},
+        )
+        zip_resp.raise_for_status()
+
+        # 3. 保存到临时文件
+        temp_zip = tempfile.NamedTemporaryFile(delete=False, suffix=".zip", dir=PROJECT_ROOT)
+        try:
+            for chunk in zip_resp.iter_content(chunk_size=8192):
+                if chunk:
+                    temp_zip.write(chunk)
+            temp_zip.close()
+
+            # 4. 解压到临时目录
+            extract_dir = tempfile.mkdtemp(prefix="mse_update_", dir=PROJECT_ROOT)
+            try:
+                with zipfile.ZipFile(temp_zip.name, "r") as zf:
+                    zf.extractall(extract_dir)
+
+                # 5. 找到解压后的顶层目录(GitHub zipball 顶层是 {owner}-{repo}-{sha}/)
+                entries = os.listdir(extract_dir)
+                if len(entries) == 1 and os.path.isdir(os.path.join(extract_dir, entries[0])):
+                    source_root = os.path.join(extract_dir, entries[0])
+                else:
+                    source_root = extract_dir
+
+                # 6. 备份需要保留的本地数据
+                backups = {}  # {相对路径: 临时备份路径}
+                backup_dir = tempfile.mkdtemp(prefix="mse_backup_", dir=PROJECT_ROOT)
+                try:
+                    for fname in PRESERVE_FILES:
+                        src = os.path.join(PROJECT_ROOT, fname)
+                        if os.path.isfile(src):
+                            dst = os.path.join(backup_dir, fname)
+                            shutil.copy2(src, dst)
+                            backups[fname] = dst
+
+                    for dname in PRESERVE_DIRS:
+                        src = os.path.join(PROJECT_ROOT, dname)
+                        if os.path.isdir(src):
+                            dst = os.path.join(backup_dir, dname)
+                            shutil.copytree(src, dst)
+                            backups[dname] = dst
+
+                    # 7. 覆盖项目文件
+                    # 遍历源码目录,复制所有文件到项目目录
+                    for item in os.listdir(source_root):
+                        src_path = os.path.join(source_root, item)
+                        dst_path = os.path.join(PROJECT_ROOT, item)
+
+                        # 跳过需要保留的文件(等会儿从备份恢复)
+                        if item in PRESERVE_FILES or item in PRESERVE_DIRS:
+                            continue
+
+                        # 先删除旧文件/目录,再复制新的
+                        try:
+                            if os.path.isdir(dst_path):
+                                shutil.rmtree(dst_path, ignore_errors=True)
+                            elif os.path.exists(dst_path):
+                                os.remove(dst_path)
+                        except Exception:
+                            pass  # 文件可能被占用,忽略错误继续
+
+                        try:
+                            if os.path.isdir(src_path):
+                                shutil.copytree(src_path, dst_path, dirs_exist_ok=True)
+                            else:
+                                shutil.copy2(src_path, dst_path)
+                        except PermissionError as exc:
+                            logger.warning("文件被占用,跳过: %s (%s)", item, exc)
+
+                    # 8. 恢复备份的本地数据
+                    for rel_path, backup_path in backups.items():
+                        dst = os.path.join(PROJECT_ROOT, rel_path)
+                        try:
+                            if os.path.isdir(backup_path):
+                                if os.path.exists(dst):
+                                    shutil.rmtree(dst)
+                                shutil.copytree(backup_path, dst)
+                            else:
+                                shutil.copy2(backup_path, dst)
+                        except Exception as exc:
+                            logger.warning("恢复备份失败: %s (%s)", rel_path, exc)
+
+                    # 9. 清理 __pycache__
+                    for root, dirs, files in os.walk(PROJECT_ROOT, topdown=False):
+                        for d in dirs:
+                            if d == "__pycache__":
+                                shutil.rmtree(os.path.join(root, d), ignore_errors=True)
+
+                    return {
+                        "ok": True,
+                        "message": "更新已下载并应用，请重启服务使更新生效",
+                        "previous_version": APP_VERSION,
+                        "latest_version": latest_version,
+                        "release_url": release_data.get("html_url", ""),
+                    }
+                finally:
+                    # 清理备份目录
+                    shutil.rmtree(backup_dir, ignore_errors=True)
+            finally:
+                # 清理解压目录
+                shutil.rmtree(extract_dir, ignore_errors=True)
+        finally:
+            # 清理临时 zip 文件
+            try:
+                os.unlink(temp_zip.name)
+            except Exception:
+                pass
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.warning("自动更新失败: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"自动更新失败: {exc}")
+
+
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=10019)
