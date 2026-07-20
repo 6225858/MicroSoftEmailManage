@@ -209,88 +209,76 @@ def _graph_request(
     method: str = "GET",
 ) -> dict:
     """
-    发起 Graph API 请求，自动处理 token 过期重试。
-    遇到 401 时强制刷新 token 后重试一次。
+    发起 Graph API 请求。
+    遇到 401 时直接抛出错误（不清空 token 缓存），让协议选择链 fallback 到 IMAP。
+    之前 401 会强制刷新 token 重试，但 M.C 格式 token 刷新后还是同样的 scope，
+    重试注定 401，且清空缓存导致 IMAP 需要重新刷新 token，浪费时间。
     """
     proxies = get_session_proxy(db, account)
     headers = {
         "Prefer": 'outlook.body-content-type="html"',
     }
 
-    for attempt in range(2):
+    try:
+        access_token = get_valid_access_token(account, db)
+    except requests.HTTPError as exc:
+        raise MailServiceError(f"token refresh failed: {exc}", tag="token_invalid") from exc
+    except OAuthServiceError as exc:
+        raise MailServiceError(f"token refresh failed: {exc}", tag="token_invalid") from exc
+
+    headers["Authorization"] = f"Bearer {access_token}"
+
+    try:
+        response = requests.request(
+            method,
+            url,
+            headers=headers,
+            params=params,
+            proxies=proxies,
+            timeout=GRAPH_TIMEOUT,
+        )
+    except requests.RequestException as exc:
+        raise MailServiceError(f"graph request network error: {exc}") from exc
+
+    if response.status_code == 401:
+        # token 不含 Mail.Read 权限或已失效
+        # 不清空缓存（IMAP 可以复用这个 token 做 XOAUTH2 认证）
+        # 直接抛出错误，让协议选择链 fallback 到 IMAP
+        token_scope = _decode_jwt_scope(access_token)
+        graph_error = ""
         try:
-            access_token = get_valid_access_token(account, db)
-        except requests.HTTPError as exc:
-            raise MailServiceError(f"token refresh failed: {exc}", tag="token_invalid") from exc
-        except OAuthServiceError as exc:
-            raise MailServiceError(f"token refresh failed: {exc}", tag="token_invalid") from exc
+            err_data = response.json()
+            err_obj = err_data.get("error") or {}
+            graph_error = err_obj.get("message") or str(err_data)[:200]
+        except Exception:
+            graph_error = response.text[:200]
 
-        headers["Authorization"] = f"Bearer {access_token}"
+        logger.info(
+            "邮箱 %s Graph API 401（token scope: %s），将 fallback 到 IMAP",
+            account.email, token_scope[:80] or "(无法解析)",
+        )
+        raise MailServiceError(
+            f"Graph API 401（token scope: {token_scope[:80] or '未知'}, "
+            f"错误: {graph_error[:120]}），将尝试 IMAP/POP3",
+            tag="token_invalid",
+        )
 
+    if not response.ok:
+        error_detail = ""
         try:
-            response = requests.request(
-                method,
-                url,
-                headers=headers,
-                params=params,
-                proxies=proxies,
-                timeout=GRAPH_TIMEOUT,
-            )
-        except requests.RequestException as exc:
-            raise MailServiceError(f"graph request network error: {exc}") from exc
+            error_data = response.json()
+            error_obj = error_data.get("error") or {}
+            error_detail = error_obj.get("message") or str(error_data)[:300]
+        except Exception:
+            error_detail = response.text[:300]
+        raise MailServiceError(
+            f"graph api error: HTTP {response.status_code}: {error_detail}"
+        )
 
-        if response.status_code == 401 and attempt == 0:
-            # token 可能有效但作用域不匹配或已失效，强制刷新后重试
-            # 记录旧 token 的实际 scope，便于诊断
-            old_scope = _decode_jwt_scope(access_token)
-            logger.warning(
-                "邮箱 %s Graph API 返回 401，强制刷新 token 重试（旧 token scope: %s）",
-                account.email, old_scope[:120] or "(无法解析)",
-            )
-            account.cached_access_token = ""
-            account.access_token_expire_time = 0
-            db.commit()
-            continue
-
-        if response.status_code == 401:
-            # 两次都 401，说明这个 client_id 拿到的 token 不含 Mail.Read 权限
-            token_scope = _decode_jwt_scope(access_token)
-            # 读 Graph API 返回的错误信息
-            graph_error = ""
-            try:
-                err_data = response.json()
-                err_obj = err_data.get("error") or {}
-                graph_error = err_obj.get("message") or str(err_data)[:200]
-            except Exception:
-                graph_error = response.text[:200]
-
-            raise MailServiceError(
-                f"graph token invalid after refresh（token 实际 scope: {token_scope[:80] or '未知'}, "
-                f"Graph 错误: {graph_error[:120]}）。"
-                f"可能原因：1) client_id 未在 Azure 注册 Mail.Read 权限；"
-                f"2) refresh_token 已被用户撤销授权。"
-                f"建议：在导入时把此账号的协议改为 imap 或 pop3（用邮箱密码取件）。",
-                tag="token_invalid",
-            )
-
-        if not response.ok:
-            error_detail = ""
-            try:
-                error_data = response.json()
-                error_obj = error_data.get("error") or {}
-                error_detail = error_obj.get("message") or str(error_data)[:300]
-            except Exception:
-                error_detail = response.text[:300]
-            raise MailServiceError(
-                f"graph api error: HTTP {response.status_code}: {error_detail}"
-            )
-
-        try:
-            return response.json()
-        except ValueError as exc:
-            raise MailServiceError(f"graph response parse error: {exc}") from exc
-
-    raise MailServiceError("graph api request failed after retry")
+    try:
+        return response.json()
+    except ValueError as exc:
+        raise MailServiceError(f"graph response parse error: {exc}") from exc
 
 
 def load_mail_messages(
@@ -445,20 +433,6 @@ def _load_with_protocol_selection(
         chain = [last_used] + [p for p in _PROTOCOL_CHAIN if p != last_used]
     else:
         chain = list(_PROTOCOL_CHAIN)
-
-    # M.C 格式 token（MSAuth）通过 login.live.com 刷新后只有 wl.imap scope，
-    # 不含 Graph API 需要的 Mail.Read scope，Graph API 一定会 401。
-    # 跳过 Graph API，直接从 IMAP 开始尝试，避免：
-    # 1. 浪费时间在一定会失败的 Graph API 上
-    # 2. Graph API 401 后强制刷新清空 token 缓存，导致 IMAP 又要重新刷新
-    # 3. 每次 get_valid_access_token 都要尝试 6 次标准 OAuth2 端点（3 scope × 2 端点）
-    refresh_token = (getattr(account, "refresh_token", "") or "").strip()
-    if refresh_token.startswith(("M.C", "M.R", "EwA", "EwB")) and "graph" in chain:
-        chain.remove("graph")
-        logger.info(
-            "邮箱 %s 检测到 MSAuth 格式令牌，跳过 Graph API，直接尝试 %s",
-            account.email, " → ".join(p.upper() for p in chain),
-        )
 
     last_error: MailServiceError | None = None
     tried: list[str] = []

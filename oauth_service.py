@@ -91,7 +91,7 @@ def _is_msauth_token(token: str) -> bool:
     return any(cleaned.startswith(prefix) for prefix in MSAUTH_TOKEN_PREFIXES)
 
 
-def _try_oauth2_refresh(token_url: str, account: MailAccount, proxies: dict | None) -> dict:
+def _try_oauth2_refresh(token_url: str, account: MailAccount, proxies: dict | None, relax_scope_check: bool = False) -> dict:
     """
     标准 OAuth2 端点刷新。不同 client_id 注册时授权的 scope 不同，
     因此按以下顺序尝试，第一个成功【且 token 实际含 Mail.Read 权限】的就返回：
@@ -103,6 +103,11 @@ def _try_oauth2_refresh(token_url: str, account: MailAccount, proxies: dict | No
     关键修复：之前会接受任何刷新成功的 token，但有些 scope（如 'openid profile email'）
     拿到的 token 没有 Mail.Read 权限，调 Graph API 会 401，导致 "graph token invalid after refresh"。
     现在通过 OAuth2 响应中的 scope 字段验证 token 是否真的含 Mail.Read。
+
+    relax_scope_check=True 时不验证 Mail.Read（用于 M.C 格式 token）：
+    某些 MSA 应用的 client_id 能通过标准端点刷新出含 Mail.Read 的 token，
+    但 OAuth2 响应的 scope 字段可能不明确列出 "mail.read"，
+    严格验证会错误拒绝有效 token，改为让 Graph API 自行验证。
     """
     cleaned_token = _sanitize_token(account.refresh_token)
 
@@ -161,9 +166,10 @@ def _try_oauth2_refresh(token_url: str, account: MailAccount, proxies: dict | No
         # 关键：验证返回的 token 实际包含 Mail.Read 权限
         # OAuth2 响应的 scope 字段表示实际授予的 scope
         granted_scope = str(payload.get("scope", "")).lower()
-        if "mail.read" not in granted_scope and "mail.readwrite" not in granted_scope:
-            # token 刷新成功但没有 Mail.Read 权限
-            # 这种 token 调 Graph API 会 401，不能用作 Graph 取件
+        has_mail_read = "mail.read" in granted_scope or "mail.readwrite" in granted_scope
+
+        if not has_mail_read and not relax_scope_check:
+            # 严格模式：token 缺少 Mail.Read 权限，跳过
             logger.warning(
                 "邮箱 %s 端点 %s scope=%r 刷新成功但 token 不含 Mail.Read（实际 scope: %s），跳过",
                 account.email, token_url, scope, granted_scope[:200],
@@ -173,7 +179,14 @@ def _try_oauth2_refresh(token_url: str, account: MailAccount, proxies: dict | No
             )
             continue
 
-        # 成功 + token 有 Mail.Read 权限
+        if not has_mail_read and relax_scope_check:
+            # 放宽模式：scope 字段不含 Mail.Read，但不拒绝（让 Graph API 自行验证）
+            logger.info(
+                "邮箱 %s 端点 %s scope=%r 刷新成功（scope 不含 Mail.Read: %s），放宽模式继续",
+                account.email, token_url, scope, granted_scope[:200],
+            )
+
+        # 成功
         logger.info(
             "邮箱 %s 端点 %s 刷新成功（scope=%r, granted=%s）",
             account.email, token_url, scope, granted_scope[:80],
@@ -298,12 +311,25 @@ def get_valid_access_token(account: MailAccount, db: Session) -> str:
     last_error: OAuthServiceError | None = None
     is_msauth = _is_msauth_token(account.refresh_token)
 
-    # M.C 格式 token（MSAuth）优化：直接用 MSAuth 端点刷新
-    # 原因：M.C 格式 token 的 client_id 通常是 MSA 应用，标准 OAuth2 端点注定失败，
-    # 每次刷新都要尝试 3 个 scope 才 fallback，浪费 3 次 HTTP 请求。
-    # 直接用 MSAuth 端点（login.live.com）+ refresh_token grant，1 次请求就能成功。
+    # M.C 格式 token（MSAuth）：
+    # 先尝试标准 OAuth2 端点（放宽 scope 验证）→ 如果成功且 token 有 Mail.Read，Graph API 直接可用
+    # 失败 → fallback 到 MSAuth 端点 → 返回 wl.imap scope token → 仅 IMAP XOAUTH2 可用
     if is_msauth:
-        logger.info("邮箱 %s MSAuth 格式令牌，直接使用 MSAuth 端点刷新", account.email)
+        for token_url in (TOKEN_URL_CONSUMER, TOKEN_URL_COMMON):
+            try:
+                payload = _try_oauth2_refresh(token_url, account, proxies, relax_scope_check=True)
+                access_token = payload["access_token"]
+                new_refresh_token = _sanitize_token(str(payload.get("refresh_token") or ""))
+                expires_in = payload.get("expires_in")
+                _store_tokens(account, db, access_token, new_refresh_token, now,
+                              expires_in=int(expires_in) if expires_in else None)
+                return access_token
+            except OAuthServiceError as exc:
+                last_error = exc
+                logger.warning("邮箱 %s 端点 %s 刷新失败: %s", account.email, token_url, str(exc)[:200])
+
+        # 标准 OAuth2 端点全部失败 → MSAuth 端点
+        logger.info("邮箱 %s 标准 OAuth2 端点失败，尝试 MSAuth 端点刷新", account.email)
         try:
             payload = _try_msauth_refresh(account, proxies)
             access_token = payload["access_token"]
@@ -315,24 +341,23 @@ def get_valid_access_token(account: MailAccount, db: Session) -> str:
         except OAuthServiceError as exc:
             last_error = exc
             logger.warning(
-                "邮箱 %s MSAuth 端点刷新失败，fallback 到标准 OAuth2 端点: %s",
+                "邮箱 %s MSAuth 端点刷新也失败: %s",
                 account.email, str(exc)[:200],
             )
-
-    # 标准 OAuth2 端点（非 MSAuth token，或 MSAuth 端点失败后 fallback）
-    # 标准 OAuth2 端点返回的 token 同时适用于 Graph API 和 IMAP XOAUTH2
-    for token_url in (TOKEN_URL_CONSUMER, TOKEN_URL_COMMON):
-        try:
-            payload = _try_oauth2_refresh(token_url, account, proxies)
-            access_token = payload["access_token"]
-            new_refresh_token = _sanitize_token(str(payload.get("refresh_token") or ""))
-            expires_in = payload.get("expires_in")
-            _store_tokens(account, db, access_token, new_refresh_token, now,
-                          expires_in=int(expires_in) if expires_in else None)
-            return access_token
-        except OAuthServiceError as exc:
-            last_error = exc
-            logger.warning("邮箱 %s 端点 %s 刷新失败: %s", account.email, token_url, str(exc)[:200])
+    else:
+        # 非 MSAuth token：标准 OAuth2 端点（严格 scope 验证）
+        for token_url in (TOKEN_URL_CONSUMER, TOKEN_URL_COMMON):
+            try:
+                payload = _try_oauth2_refresh(token_url, account, proxies)
+                access_token = payload["access_token"]
+                new_refresh_token = _sanitize_token(str(payload.get("refresh_token") or ""))
+                expires_in = payload.get("expires_in")
+                _store_tokens(account, db, access_token, new_refresh_token, now,
+                              expires_in=int(expires_in) if expires_in else None)
+                return access_token
+            except OAuthServiceError as exc:
+                last_error = exc
+                logger.warning("邮箱 %s 端点 %s 刷新失败: %s", account.email, token_url, str(exc)[:200])
 
     logger.error("邮箱 %s OAuth 刷新失败（所有端点均失败）", account.email)
     raise last_error or OAuthServiceError("unknown token refresh error")
