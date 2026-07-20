@@ -35,7 +35,7 @@ from proxy_service import import_proxy_line, test_proxies_status
 logger = logging.getLogger("icutool_mail")
 
 # ── 应用版本 & 配置 ──────────────────────────────────────
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.3"
 DEFAULT_GITHUB_REPO = "6225858/MicroSoftEmailManage"
 SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
 
