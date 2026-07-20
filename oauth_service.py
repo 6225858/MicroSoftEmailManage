@@ -291,7 +291,12 @@ def get_valid_access_token(account: MailAccount, db: Session) -> str:
     # 标准 OAuth2 端点返回的 token 同时适用于 Graph API 和 IMAP XOAUTH2，
     # 这样即使没有代理（IMAP 直连被 IP 限制），Graph API 也能正常取件。
     # 即使 refresh_token 是 MSAuth 格式(M.C开头)，标准端点也常常可以接受。
-    for token_url in (TOKEN_URL_CONSUMER, TOKEN_URL_COMMON):
+    #
+    # 优化：M.C 格式 token 如果第一个标准端点(consumers)失败，
+    # 第二个端点(common)大概率也失败，直接 fallback 到 MSAuth 端点，
+    # 避免浪费时间在 6 次注定失败的标准 OAuth2 请求上（3 scope × 2 端点）
+    standard_endpoints = (TOKEN_URL_CONSUMER, TOKEN_URL_COMMON) if not is_msauth else (TOKEN_URL_CONSUMER,)
+    for token_url in standard_endpoints:
         try:
             payload = _try_oauth2_refresh(token_url, account, proxies)
             access_token = payload["access_token"]

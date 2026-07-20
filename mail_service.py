@@ -446,6 +446,20 @@ def _load_with_protocol_selection(
     else:
         chain = list(_PROTOCOL_CHAIN)
 
+    # M.C 格式 token（MSAuth）通过 login.live.com 刷新后只有 wl.imap scope，
+    # 不含 Graph API 需要的 Mail.Read scope，Graph API 一定会 401。
+    # 跳过 Graph API，直接从 IMAP 开始尝试，避免：
+    # 1. 浪费时间在一定会失败的 Graph API 上
+    # 2. Graph API 401 后强制刷新清空 token 缓存，导致 IMAP 又要重新刷新
+    # 3. 每次 get_valid_access_token 都要尝试 6 次标准 OAuth2 端点（3 scope × 2 端点）
+    refresh_token = (getattr(account, "refresh_token", "") or "").strip()
+    if refresh_token.startswith(("M.C", "M.R", "EwA", "EwB")) and "graph" in chain:
+        chain.remove("graph")
+        logger.info(
+            "邮箱 %s 检测到 MSAuth 格式令牌，跳过 Graph API，直接尝试 %s",
+            account.email, " → ".join(p.upper() for p in chain),
+        )
+
     last_error: MailServiceError | None = None
     tried: list[str] = []
     errors: list[str] = []  # 收集所有协议的失败原因
