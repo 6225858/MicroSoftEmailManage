@@ -858,14 +858,40 @@ def load_pop3_messages(
     folder: str = "inbox",
     limit: int = 20,
 ) -> list[dict]:
-    """通过 POP3 协议取件（密码认证），POP3 仅支持收件箱。"""
+    """通过 POP3 协议取件。
+    - 如果账号有 refresh_token + client_id，优先用 OAuth2 access_token (XOAUTH2) 认证
+    - 否则用邮箱密码认证
+    两种方式自动切换，无需用户手动选择。
+    POP3 仅支持收件箱。
+    """
     server, port, use_ssl = _resolve_pop3_config(account)
     password = account.password or ""
 
-    if not password:
+    # 判定是否可用 OAuth2 access_token 认证
+    use_oauth2 = bool(account.refresh_token and account.client_id)
+    access_token: str | None = None
+
+    if use_oauth2:
+        try:
+            access_token = get_valid_access_token(account, db)
+        except OAuthServiceError as exc:
+            # OAuth2 失败时若仍有密码，fallback 到密码认证
+            if password:
+                logger.warning(
+                    "邮箱 %s POP3 OAuth2 取 token 失败，回退到密码认证: %s",
+                    account.email, str(exc)[:150],
+                )
+                use_oauth2 = False
+            else:
+                raise MailServiceError(
+                    f"POP3 OAuth2 令牌获取失败: {exc}",
+                    tag="oauth_token_failed",
+                ) from exc
+
+    if not use_oauth2 and not password:
         raise MailServiceError(
-            "POP3 取件需要邮箱密码，请在导入或备注中补全密码",
-            tag="password_missing",
+            "POP3 取件需要邮箱密码或 OAuth2 令牌（refresh_token + client_id），请补全其中之一",
+            tag="auth_missing",
         )
 
     try:
@@ -877,14 +903,44 @@ def load_pop3_messages(
         raise MailServiceError(f"POP3 连接失败 ({server}:{port}): {exc}") from exc
 
     try:
-        try:
-            pop.user(account.email)
-            pop.pass_(password)
-        except poplib.error_proto as exc:
-            raise MailServiceError(
-                f"POP3 login failed: {exc}",
-                tag="pop3_auth_failed",
-            ) from exc
+        # 认证
+        if use_oauth2 and access_token:
+            try:
+                # POP3 XOAUTH2 认证:发送 AUTH XOAUTH2 <base64(auth_string)>
+                import base64
+                auth_string = f"user={account.email}\x01auth=Bearer {access_token}\x01\x01"
+                encoded_auth = base64.b64encode(auth_string.encode("utf-8")).decode("ascii")
+                pop._shortcmd(f"AUTH XOAUTH2 {encoded_auth}")
+                logger.info("邮箱 %s POP3 XOAUTH2 认证成功", account.email)
+            except poplib.error_proto as exc:
+                # XOAUTH2 失败时如果有密码，fallback 到密码认证
+                if password:
+                    logger.warning(
+                        "邮箱 %s POP3 XOAUTH2 认证失败，回退到密码认证: %s",
+                        account.email, str(exc)[:150],
+                    )
+                    try:
+                        pop.user(account.email)
+                        pop.pass_(password)
+                    except poplib.error_proto as exc2:
+                        raise MailServiceError(
+                            f"POP3 login failed: {exc2}",
+                            tag="pop3_auth_failed",
+                        ) from exc2
+                else:
+                    raise MailServiceError(
+                        f"POP3 XOAUTH2 login failed: {exc}",
+                        tag="pop3_auth_failed",
+                    ) from exc
+        else:
+            try:
+                pop.user(account.email)
+                pop.pass_(password)
+            except poplib.error_proto as exc:
+                raise MailServiceError(
+                    f"POP3 login failed: {exc}",
+                    tag="pop3_auth_failed",
+                ) from exc
 
         # POP3 没有 "junk" 文件夹概念
         stat = pop.stat()
