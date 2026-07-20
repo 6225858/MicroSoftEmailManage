@@ -9,6 +9,7 @@ from typing import Optional
 from urllib.parse import quote
 
 import uvicorn
+import requests
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -1170,7 +1171,7 @@ def check_update():
     - 返回 { has_update, current_version, latest_version, release_url, ... }
     """
     settings = load_settings()
-    github_repo = (settings.get("github_repo") or "").strip()
+    github_repo = (settings.get("github_repo") or "").strip() or DEFAULT_GITHUB_REPO
     if not github_repo:
         return {
             "has_update": False,
@@ -1188,10 +1189,9 @@ def check_update():
         }
 
     try:
-        import requests as _requests
         # requests 会自动读取 HTTP_PROXY/HTTPS_PROXY 环境变量,
         # 如果用户在系统/启动脚本中设置了代理变量即可走代理
-        response = _requests.get(
+        response = requests.get(
             f"https://api.github.com/repos/{github_repo}/releases/latest",
             timeout=15,
             headers={
@@ -1261,7 +1261,7 @@ def perform_update():
     from fastapi.responses import StreamingResponse
 
     settings = load_settings()
-    github_repo = (settings.get("github_repo") or "").strip()
+    github_repo = (settings.get("github_repo") or "").strip() or DEFAULT_GITHUB_REPO
     if not github_repo:
         github_repo = DEFAULT_GITHUB_REPO
     github_repo = github_repo.replace("https://github.com/", "").replace("http://github.com/", "").strip("/")
