@@ -3171,6 +3171,17 @@ function handleUpdateProgressEvent(data) {
                     .join("");
             }
         }
+        // 显示数据恢复失败警告(如果有)
+        if (data.restore_errors && data.restore_errors.length > 0) {
+            if (elements.updateSkippedFiles) elements.updateSkippedFiles.hidden = false;
+            if (elements.updateSkippedFilesList) {
+                const existing = elements.updateSkippedFilesList.innerHTML;
+                const warningHtml = data.restore_errors
+                    .map((e) => `<div class="skipped-file-item" style="color: var(--color-danger, #e53e3e);">⚠ 数据恢复失败: ${escapeHtml(String(e))}</div>`)
+                    .join("");
+                elements.updateSkippedFilesList.innerHTML = existing + warningHtml;
+            }
+        }
         if (elements.settingsPerformUpdateBtn) elements.settingsPerformUpdateBtn.hidden = true;
     } else if (stage === "restarting") {
         // 服务正在重启

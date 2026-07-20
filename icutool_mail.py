@@ -1469,24 +1469,32 @@ def perform_update():
                     skipped_files.append(f"{item} ({exc})")
 
             # 恢复备份的本地数据
+            # 使用 dirs_exist_ok=True 合并目录,避免 "先删后恢复" 的致命风险:
+            #   1. Docker 环境中 /app/data 是 bind mount 挂载点,rmtree 清空宿主机数据后
+            #      挂载点目录仍存在,copytree 会因目标已存在而抛异常,异常被忽略导致数据永久丢失
+            #   2. 非 Docker 环境中 rmtree 成功但 copytree 失败(文件占用/权限/磁盘满)同样丢数据
+            restore_errors = []
             for rel_path, backup_path in backups.items():
                 dst = os.path.join(PROJECT_ROOT, rel_path)
                 try:
                     if os.path.isdir(backup_path):
-                        if os.path.exists(dst):
-                            shutil.rmtree(dst)
-                        shutil.copytree(backup_path, dst)
+                        shutil.copytree(backup_path, dst, dirs_exist_ok=True)
                     else:
                         shutil.copy2(backup_path, dst)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    restore_errors.append(f"{rel_path}: {exc}")
+                    logger.warning("恢复备份 %s 失败: %s", rel_path, exc)
 
             yield _emit("applied", f"文件覆盖完成（跳过 {len(skipped_files)} 个被占用文件）", 92,
-                        skipped_files=skipped_files)
+                        skipped_files=skipped_files,
+                        restore_errors=restore_errors if restore_errors else None)
 
             # ── 阶段 6: 清理 ──
             yield _emit("cleaning", "正在清理临时文件和 __pycache__…", 96)
             for root, dirs, files in os.walk(PROJECT_ROOT, topdown=False):
+                # 跳过临时备份/解压目录,避免误删备份数据
+                dirs[:] = [d for d in dirs
+                           if not d.startswith("mse_backup_") and not d.startswith("mse_update_")]
                 for d in dirs:
                     if d == "__pycache__":
                         shutil.rmtree(os.path.join(root, d), ignore_errors=True)
@@ -1496,6 +1504,7 @@ def perform_update():
                         latest_version=latest_version,
                         release_url=release_url,
                         skipped_files=skipped_files,
+                        restore_errors=restore_errors if restore_errors else None,
                         suggestion="请重启服务使更新生效（关闭当前命令行窗口，重新执行 python icutool_mail.py）")
 
             # 把新版本号写入 settings.json,这样即使代码中的 APP_VERSION 没同步更新,
@@ -1503,6 +1512,13 @@ def perform_update():
             update_settings = load_settings()
             update_settings["installed_version"] = latest_version
             save_settings(update_settings)
+
+            # 更新成功,清理 backup_dir（此时数据已正确恢复,不再需要备份）
+            # 必须在启动重启线程之前清理,因为 _delayed_restart 会调用 os._exit(0)
+            # 直接终止进程,不会执行 finally 块
+            if backup_dir:
+                shutil.rmtree(backup_dir, ignore_errors=True)
+                backup_dir = None  # 标记已清理,防止 finally 重复处理
 
             # ── 自动重启 ──
             # 启动守护线程:等待响应发送完毕 → 启动重启脚本 → 退出当前进程
@@ -1595,8 +1611,13 @@ def perform_update():
             logger.warning("自动更新失败: %s", exc, exc_info=True)
             error_type = type(exc).__name__
             suggestion = "请查看服务端日志获取详细信息。常见原因：\n1) 文件被占用 → 先停止服务再更新\n2) 网络问题 → 配置代理后重试\n3) 权限不足 → 用管理员权限运行"
-            yield _emit("error", f"更新过程中发生异常: {exc}（{error_type}）", 0,
-                        error_type=error_type, suggestion=suggestion)
+            # 更新失败时保留 backup_dir,以便用户手动恢复数据
+            backup_hint = ""
+            if backup_dir:
+                backup_hint = f"\n\n您的数据备份已保留在: {backup_dir}\n可手动将该目录下的 data/ 文件夹复制回项目根目录以恢复数据。"
+            yield _emit("error", f"更新过程中发生异常: {exc}（{error_type}）{backup_hint}", 0,
+                        error_type=error_type, suggestion=suggestion,
+                        backup_dir=backup_dir if backup_dir else None)
         finally:
             # 清理临时文件
             if temp_zip_path:
@@ -1606,8 +1627,10 @@ def perform_update():
                     pass
             if extract_dir:
                 shutil.rmtree(extract_dir, ignore_errors=True)
+            # backup_dir: 更新成功时已在上方清理(backup_dir=None)
+            # 更新失败时保留,以便用户手动恢复邮箱账号等数据
             if backup_dir:
-                shutil.rmtree(backup_dir, ignore_errors=True)
+                logger.warning("更新未完成,本地数据备份保留在: %s", backup_dir)
 
     return StreamingResponse(generate(), media_type="application/x-ndjson")
 
