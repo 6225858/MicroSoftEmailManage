@@ -7,7 +7,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="/static/app.css?v=16">
+    <link rel="stylesheet" href="/static/app.css?v=17">
 </head>
 <body>
     <div class="page-shell app-shell">
@@ -588,6 +588,77 @@
         </section>
     </div>
 
+    <div id="update-progress-modal" class="modal-shell" hidden>
+        <div id="update-progress-backdrop" class="modal-backdrop"></div>
+        <section class="modal-card" role="dialog" aria-modal="true" aria-labelledby="update-progress-title">
+            <div class="modal-head">
+                <div>
+                    <p class="eyebrow">Auto Update</p>
+                    <h3 id="update-progress-title">正在更新</h3>
+                    <p class="muted" id="update-progress-subtitle">请勿关闭页面</p>
+                </div>
+                <button id="update-progress-close-btn" class="icon-button" type="button" aria-label="关闭" hidden>×</button>
+            </div>
+
+            <div class="update-modal-body">
+                <!-- 进度条 -->
+                <div class="update-progress-bar-wrap">
+                    <div class="update-progress-bar">
+                        <div id="update-progress-fill" class="update-progress-fill" style="width: 0%"></div>
+                    </div>
+                    <span id="update-progress-percent" class="update-progress-percent">0%</span>
+                </div>
+
+                <!-- 阶段文字 -->
+                <p id="update-progress-stage" class="update-progress-stage">准备中…</p>
+
+                <!-- 版本信息 -->
+                <div id="update-version-info" class="update-version-info" hidden>
+                    <span class="info-label">版本变化</span>
+                    <strong id="update-version-change" class="version-display">—</strong>
+                </div>
+
+                <!-- 跳过的文件 -->
+                <div id="update-skipped-files" class="update-skipped-files" hidden>
+                    <span class="info-label">被占用而跳过的文件</span>
+                    <div id="update-skipped-files-list" class="update-skipped-list"></div>
+                </div>
+
+                <!-- 错误区域 -->
+                <div id="update-error-box" class="update-error-box" hidden>
+                    <div class="update-error-header">
+                        <span class="update-error-icon">!</span>
+                        <strong>更新失败</strong>
+                    </div>
+                    <div id="update-error-message" class="update-error-message"></div>
+                    <div id="update-error-suggestion" class="update-error-suggestion"></div>
+                </div>
+
+                <!-- 成功区域 -->
+                <div id="update-success-box" class="update-success-box" hidden>
+                    <div class="update-success-header">
+                        <span class="update-success-icon">✓</span>
+                        <strong>更新完成</strong>
+                    </div>
+                    <p id="update-success-message" class="update-success-message"></p>
+                    <div class="update-restart-hint">
+                        <span class="info-label">下一步</span>
+                        <p>请重启服务使更新生效：</p>
+                        <ol>
+                            <li>关闭当前运行服务的命令行窗口（或停止 Docker 容器）</li>
+                            <li>重新启动：<code>python icutool_mail.py</code></li>
+                            <li>刷新浏览器（Ctrl+F5）</li>
+                        </ol>
+                    </div>
+                </div>
+            </div>
+
+            <div class="modal-actions">
+                <button id="update-progress-cancel-btn" class="button button-ghost" type="button">关闭</button>
+            </div>
+        </section>
+    </div>
+
     <div id="delete-confirm-modal" class="modal-shell" hidden>
         <div id="delete-confirm-backdrop" class="modal-backdrop"></div>
         <section class="modal-card" role="dialog" aria-modal="true" aria-labelledby="delete-confirm-title">
@@ -615,6 +686,6 @@
         </section>
     </div>
 
-    <script src="/static/app.js?v=14"></script>
+    <script src="/static/app.js?v=15"></script>
 </body>
 </html>

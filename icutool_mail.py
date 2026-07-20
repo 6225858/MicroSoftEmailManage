@@ -35,6 +35,7 @@ logger = logging.getLogger("icutool_mail")
 
 # ── 应用版本 & 配置 ──────────────────────────────────────
 APP_VERSION = "1.0.0"
+DEFAULT_GITHUB_REPO = "6225858/MicroSoftEmailManage"
 SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
 
 
@@ -1155,7 +1156,7 @@ def get_version():
     settings = load_settings()
     return {
         "version": APP_VERSION,
-        "github_repo": settings.get("github_repo", ""),
+        "github_repo": settings.get("github_repo", "") or DEFAULT_GITHUB_REPO,
     }
 
 
@@ -1249,176 +1250,220 @@ def save_settings_api(body: SettingsBody):
 
 @app.post("/api/perform-update", dependencies=[Depends(require_api_key)])
 def perform_update():
-    """下载 GitHub Release 源码 zip 并覆盖项目文件,实现一键自动更新。
+    """流式下载 GitHub Release 源码 zip 并覆盖项目文件,实时返回更新进度(NDJSON)。
 
-    流程:
-    1. 获取最新 release 的 zipball_url
-    2. 下载源码 zip 到临时文件
-    3. 解压,跳过顶层目录(GitHub zipball 格式)
-    4. 备份需要保留的本地数据(settings.json/mail.db/data/等)
-    5. 用新文件覆盖项目目录
-    6. 恢复备份的本地数据
-    7. 返回更新结果,前端提示用户重启服务
+    每行一个 JSON: {"stage": "...", "message": "...", "progress": 0-100, ...}
+    最终行: {"stage": "done"/"error", ...}
     """
     import tempfile
     import zipfile
     import shutil
+    from fastapi.responses import StreamingResponse
 
     settings = load_settings()
     github_repo = (settings.get("github_repo") or "").strip()
     if not github_repo:
-        raise HTTPException(status_code=400, detail="未配置 GitHub 仓库地址，请先在设置中填写")
-
+        github_repo = DEFAULT_GITHUB_REPO
     github_repo = github_repo.replace("https://github.com/", "").replace("http://github.com/", "").strip("/")
-    if github_repo.count("/") != 1:
-        raise HTTPException(status_code=400, detail="GitHub 仓库地址格式不正确")
 
-    # 需要保留的本地数据文件和目录(更新时不能覆盖)
     PRESERVE_FILES = ["settings.json", "mail.db", ".env", ".env.local", ".env.production"]
     PRESERVE_DIRS = ["data", "logs"]
     PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 
-    try:
-        # 1. 获取最新 release 信息
-        release_resp = requests.get(
-            f"https://api.github.com/repos/{github_repo}/releases/latest",
-            timeout=15,
-            headers={
-                "Accept": "application/vnd.github+json",
-                "User-Agent": "MicroSoftEmailManage-UpdateChecker",
-            },
-        )
-        if release_resp.status_code == 404:
-            raise HTTPException(status_code=404, detail="GitHub 上尚未发布任何 release")
-        release_resp.raise_for_status()
-        release_data = release_resp.json()
+    def _emit(stage, message, progress=None, **extra):
+        payload = {"stage": stage, "message": message}
+        if progress is not None:
+            payload["progress"] = progress
+        payload.update(extra)
+        return json.dumps(payload, ensure_ascii=False) + "\n"
 
-        latest_version = (release_data.get("tag_name") or "").lstrip("vV")
-        if compare_versions(latest_version, APP_VERSION) <= 0:
-            return {"ok": False, "error": "当前已是最新版本", "current_version": APP_VERSION, "latest_version": latest_version}
-
-        # 2. 下载源码 zip(GitHub zipball_url 总是可用,不依赖 Release 附件)
-        zipball_url = release_data.get("zipball_url") or f"https://github.com/{github_repo}/archive/refs/tags/{release_data.get('tag_name', '')}.zip"
-
-        logger.info("开始下载更新: %s (v%s)", zipball_url, latest_version)
-        zip_resp = requests.get(
-            zipball_url,
-            timeout=120,
-            stream=True,
-            headers={"User-Agent": "MicroSoftEmailManage-UpdateChecker"},
-        )
-        zip_resp.raise_for_status()
-
-        # 3. 保存到临时文件
-        temp_zip = tempfile.NamedTemporaryFile(delete=False, suffix=".zip", dir=PROJECT_ROOT)
+    def generate():
+        temp_zip_path = None
+        extract_dir = None
+        backup_dir = None
         try:
-            for chunk in zip_resp.iter_content(chunk_size=8192):
-                if chunk:
-                    temp_zip.write(chunk)
-            temp_zip.close()
+            # ── 阶段 1: 获取最新 release 信息 ──
+            yield _emit("start", "正在初始化更新流程…", 5)
+            if github_repo.count("/") != 1:
+                yield _emit("error", "GitHub 仓库地址格式不正确，应为 owner/repo", 0,
+                            error_type="config", suggestion="请在设置中填写正确的 GitHub 仓库地址（格式：owner/repo）")
+                return
 
-            # 4. 解压到临时目录
+            yield _emit("fetching", "正在获取 GitHub 最新 Release 信息…", 10)
+            try:
+                release_resp = requests.get(
+                    f"https://api.github.com/repos/{github_repo}/releases/latest",
+                    timeout=15,
+                    headers={"Accept": "application/vnd.github+json", "User-Agent": "MicroSoftEmailManage-UpdateChecker"},
+                )
+                if release_resp.status_code == 404:
+                    yield _emit("error", f"GitHub 仓库 {github_repo} 上尚未发布任何 Release", 10,
+                                error_type="no_release", suggestion=f"请在 https://github.com/{github_repo}/releases/new 创建 Release（tag 如 v1.0.0）")
+                    return
+                release_resp.raise_for_status()
+            except requests.RequestException as exc:
+                yield _emit("error", f"获取 Release 信息失败: {exc}", 10,
+                            error_type="network", suggestion="请检查网络连接。如果在国内，请配置 HTTP_PROXY / HTTPS_PROXY 环境变量后重启服务再试")
+                return
+
+            release_data = release_resp.json()
+            latest_version = (release_data.get("tag_name") or "").lstrip("vV")
+            release_url = release_data.get("html_url", "")
+
+            if not latest_version:
+                yield _emit("error", "无法解析最新版本号（Release 的 tag_name 为空）", 15,
+                            error_type="parse_error", suggestion="请在 GitHub Release 中设置正确的 tag（如 v1.0.1）")
+                return
+
+            if compare_versions(latest_version, APP_VERSION) <= 0:
+                yield _emit("error", f"当前版本 {APP_VERSION} 已是最新（最新 Release: {latest_version}）", 15,
+                            error_type="up_to_date", suggestion="无需更新")
+                return
+
+            yield _emit("version_checked", f"发现新版本 {latest_version}（当前 {APP_VERSION}）", 20,
+                        latest_version=latest_version, current_version=APP_VERSION)
+
+            # ── 阶段 2: 下载源码 zip ──
+            zipball_url = release_data.get("zipball_url") or f"https://github.com/{github_repo}/archive/refs/tags/{release_data.get('tag_name', '')}.zip"
+            yield _emit("downloading", "正在下载源码包…（可能需要 30 秒 - 2 分钟）", 30)
+
+            try:
+                zip_resp = requests.get(zipball_url, timeout=120, stream=True,
+                                         headers={"User-Agent": "MicroSoftEmailManage-UpdateChecker"})
+                zip_resp.raise_for_status()
+            except requests.RequestException as exc:
+                yield _emit("error", f"下载源码包失败: {exc}", 30,
+                            error_type="download_failed", suggestion="请检查网络连接。如果反复失败，请手动从 GitHub 下载源码 zip 并解压覆盖项目文件")
+                return
+
+            # 保存到临时文件
+            tf = tempfile.NamedTemporaryFile(delete=False, suffix=".zip", dir=PROJECT_ROOT)
+            temp_zip_path = tf.name
+            try:
+                downloaded = 0
+                for chunk in zip_resp.iter_content(chunk_size=65536):
+                    if chunk:
+                        tf.write(chunk)
+                        downloaded += len(chunk)
+                tf.close()
+                yield _emit("downloaded", f"下载完成（{downloaded // 1024} KB）", 50)
+            except Exception as exc:
+                tf.close()
+                yield _emit("error", f"写入临时文件失败: {exc}", 50,
+                            error_type="io_error", suggestion="请检查项目目录的磁盘空间和写入权限")
+                return
+
+            # ── 阶段 3: 解压 ──
+            yield _emit("extracting", "正在解压源码包…", 60)
             extract_dir = tempfile.mkdtemp(prefix="mse_update_", dir=PROJECT_ROOT)
             try:
-                with zipfile.ZipFile(temp_zip.name, "r") as zf:
+                with zipfile.ZipFile(temp_zip_path, "r") as zf:
                     zf.extractall(extract_dir)
+            except zipfile.BadZipFile as exc:
+                yield _emit("error", f"解压失败（zip 文件损坏）: {exc}", 60,
+                            error_type="bad_zip", suggestion="下载的文件可能损坏，请重试。如果反复失败，请手动从 GitHub 下载")
+                return
 
-                # 5. 找到解压后的顶层目录(GitHub zipball 顶层是 {owner}-{repo}-{sha}/)
-                entries = os.listdir(extract_dir)
-                if len(entries) == 1 and os.path.isdir(os.path.join(extract_dir, entries[0])):
-                    source_root = os.path.join(extract_dir, entries[0])
-                else:
-                    source_root = extract_dir
+            entries = os.listdir(extract_dir)
+            if len(entries) == 1 and os.path.isdir(os.path.join(extract_dir, entries[0])):
+                source_root = os.path.join(extract_dir, entries[0])
+            else:
+                source_root = extract_dir
 
-                # 6. 备份需要保留的本地数据
-                backups = {}  # {相对路径: 临时备份路径}
-                backup_dir = tempfile.mkdtemp(prefix="mse_backup_", dir=PROJECT_ROOT)
+            yield _emit("extracted", "解压完成", 65)
+
+            # ── 阶段 4: 备份本地数据 ──
+            yield _emit("backing_up", "正在备份本地数据（settings.json / mail.db / data/）…", 75)
+            backups = {}
+            backup_dir = tempfile.mkdtemp(prefix="mse_backup_", dir=PROJECT_ROOT)
+            for fname in PRESERVE_FILES:
+                src = os.path.join(PROJECT_ROOT, fname)
+                if os.path.isfile(src):
+                    dst = os.path.join(backup_dir, fname)
+                    shutil.copy2(src, dst)
+                    backups[fname] = dst
+            for dname in PRESERVE_DIRS:
+                src = os.path.join(PROJECT_ROOT, dname)
+                if os.path.isdir(src):
+                    dst = os.path.join(backup_dir, dname)
+                    shutil.copytree(src, dst)
+                    backups[dname] = dst
+            yield _emit("backed_up", f"已备份 {len(backups)} 个本地数据项", 80)
+
+            # ── 阶段 5: 覆盖项目文件 ──
+            yield _emit("applying", "正在应用更新（覆盖项目文件）…", 85)
+            skipped_files = []
+            for item in os.listdir(source_root):
+                src_path = os.path.join(source_root, item)
+                dst_path = os.path.join(PROJECT_ROOT, item)
+                if item in PRESERVE_FILES or item in PRESERVE_DIRS:
+                    continue
                 try:
-                    for fname in PRESERVE_FILES:
-                        src = os.path.join(PROJECT_ROOT, fname)
-                        if os.path.isfile(src):
-                            dst = os.path.join(backup_dir, fname)
-                            shutil.copy2(src, dst)
-                            backups[fname] = dst
+                    if os.path.isdir(dst_path):
+                        shutil.rmtree(dst_path, ignore_errors=True)
+                    elif os.path.exists(dst_path):
+                        os.remove(dst_path)
+                except Exception:
+                    pass
+                try:
+                    if os.path.isdir(src_path):
+                        shutil.copytree(src_path, dst_path, dirs_exist_ok=True)
+                    else:
+                        shutil.copy2(src_path, dst_path)
+                except PermissionError:
+                    skipped_files.append(item)
+                except Exception as exc:
+                    skipped_files.append(f"{item} ({exc})")
 
-                    for dname in PRESERVE_DIRS:
-                        src = os.path.join(PROJECT_ROOT, dname)
-                        if os.path.isdir(src):
-                            dst = os.path.join(backup_dir, dname)
-                            shutil.copytree(src, dst)
-                            backups[dname] = dst
+            # 恢复备份的本地数据
+            for rel_path, backup_path in backups.items():
+                dst = os.path.join(PROJECT_ROOT, rel_path)
+                try:
+                    if os.path.isdir(backup_path):
+                        if os.path.exists(dst):
+                            shutil.rmtree(dst)
+                        shutil.copytree(backup_path, dst)
+                    else:
+                        shutil.copy2(backup_path, dst)
+                except Exception:
+                    pass
 
-                    # 7. 覆盖项目文件
-                    # 遍历源码目录,复制所有文件到项目目录
-                    for item in os.listdir(source_root):
-                        src_path = os.path.join(source_root, item)
-                        dst_path = os.path.join(PROJECT_ROOT, item)
+            yield _emit("applied", f"文件覆盖完成（跳过 {len(skipped_files)} 个被占用文件）", 92,
+                        skipped_files=skipped_files)
 
-                        # 跳过需要保留的文件(等会儿从备份恢复)
-                        if item in PRESERVE_FILES or item in PRESERVE_DIRS:
-                            continue
+            # ── 阶段 6: 清理 ──
+            yield _emit("cleaning", "正在清理临时文件和 __pycache__…", 96)
+            for root, dirs, files in os.walk(PROJECT_ROOT, topdown=False):
+                for d in dirs:
+                    if d == "__pycache__":
+                        shutil.rmtree(os.path.join(root, d), ignore_errors=True)
 
-                        # 先删除旧文件/目录,再复制新的
-                        try:
-                            if os.path.isdir(dst_path):
-                                shutil.rmtree(dst_path, ignore_errors=True)
-                            elif os.path.exists(dst_path):
-                                os.remove(dst_path)
-                        except Exception:
-                            pass  # 文件可能被占用,忽略错误继续
+            yield _emit("done", "更新完成", 100,
+                        previous_version=APP_VERSION,
+                        latest_version=latest_version,
+                        release_url=release_url,
+                        skipped_files=skipped_files,
+                        suggestion="请重启服务使更新生效（关闭当前命令行窗口，重新执行 python icutool_mail.py）")
 
-                        try:
-                            if os.path.isdir(src_path):
-                                shutil.copytree(src_path, dst_path, dirs_exist_ok=True)
-                            else:
-                                shutil.copy2(src_path, dst_path)
-                        except PermissionError as exc:
-                            logger.warning("文件被占用,跳过: %s (%s)", item, exc)
-
-                    # 8. 恢复备份的本地数据
-                    for rel_path, backup_path in backups.items():
-                        dst = os.path.join(PROJECT_ROOT, rel_path)
-                        try:
-                            if os.path.isdir(backup_path):
-                                if os.path.exists(dst):
-                                    shutil.rmtree(dst)
-                                shutil.copytree(backup_path, dst)
-                            else:
-                                shutil.copy2(backup_path, dst)
-                        except Exception as exc:
-                            logger.warning("恢复备份失败: %s (%s)", rel_path, exc)
-
-                    # 9. 清理 __pycache__
-                    for root, dirs, files in os.walk(PROJECT_ROOT, topdown=False):
-                        for d in dirs:
-                            if d == "__pycache__":
-                                shutil.rmtree(os.path.join(root, d), ignore_errors=True)
-
-                    return {
-                        "ok": True,
-                        "message": "更新已下载并应用，请重启服务使更新生效",
-                        "previous_version": APP_VERSION,
-                        "latest_version": latest_version,
-                        "release_url": release_data.get("html_url", ""),
-                    }
-                finally:
-                    # 清理备份目录
-                    shutil.rmtree(backup_dir, ignore_errors=True)
-            finally:
-                # 清理解压目录
-                shutil.rmtree(extract_dir, ignore_errors=True)
+        except Exception as exc:
+            logger.warning("自动更新失败: %s", exc, exc_info=True)
+            error_type = type(exc).__name__
+            suggestion = "请查看服务端日志获取详细信息。常见原因：\n1) 文件被占用 → 先停止服务再更新\n2) 网络问题 → 配置代理后重试\n3) 权限不足 → 用管理员权限运行"
+            yield _emit("error", f"更新过程中发生异常: {exc}（{error_type}）", 0,
+                        error_type=error_type, suggestion=suggestion)
         finally:
-            # 清理临时 zip 文件
-            try:
-                os.unlink(temp_zip.name)
-            except Exception:
-                pass
+            # 清理临时文件
+            if temp_zip_path:
+                try:
+                    os.unlink(temp_zip_path)
+                except Exception:
+                    pass
+            if extract_dir:
+                shutil.rmtree(extract_dir, ignore_errors=True)
+            if backup_dir:
+                shutil.rmtree(backup_dir, ignore_errors=True)
 
-    except HTTPException:
-        raise
-    except Exception as exc:
-        logger.warning("自动更新失败: %s", exc, exc_info=True)
-        raise HTTPException(status_code=500, detail=f"自动更新失败: {exc}")
+    return StreamingResponse(generate(), media_type="application/x-ndjson")
 
 
 if __name__ == "__main__":

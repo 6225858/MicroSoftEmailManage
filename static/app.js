@@ -243,6 +243,25 @@ const elements = {
     settingsReleaseLink: document.getElementById("settings-release-link"),
     settingsUpdateMessage: document.getElementById("settings-update-message"),
     settingsPerformUpdateBtn: document.getElementById("settings-perform-update-btn"),
+    // 更新进度弹窗
+    updateProgressModal: document.getElementById("update-progress-modal"),
+    updateProgressBackdrop: document.getElementById("update-progress-backdrop"),
+    updateProgressCloseBtn: document.getElementById("update-progress-close-btn"),
+    updateProgressCancelBtn: document.getElementById("update-progress-cancel-btn"),
+    updateProgressTitle: document.getElementById("update-progress-title"),
+    updateProgressSubtitle: document.getElementById("update-progress-subtitle"),
+    updateProgressFill: document.getElementById("update-progress-fill"),
+    updateProgressPercent: document.getElementById("update-progress-percent"),
+    updateProgressStage: document.getElementById("update-progress-stage"),
+    updateVersionInfo: document.getElementById("update-version-info"),
+    updateVersionChange: document.getElementById("update-version-change"),
+    updateSkippedFiles: document.getElementById("update-skipped-files"),
+    updateSkippedFilesList: document.getElementById("update-skipped-files-list"),
+    updateErrorBox: document.getElementById("update-error-box"),
+    updateErrorMessage: document.getElementById("update-error-message"),
+    updateErrorSuggestion: document.getElementById("update-error-suggestion"),
+    updateSuccessBox: document.getElementById("update-success-box"),
+    updateSuccessMessage: document.getElementById("update-success-message"),
     remarkInput: document.getElementById("remark-input"),
     saveTagsBtn: document.getElementById("save-tags-btn"),
     saveRemarkBtn: document.getElementById("save-remark-btn"),
@@ -3014,38 +3033,176 @@ async function checkForUpdate() {
 }
 
 async function performUpdate() {
-    if (!window.confirm("确认要自动下载并更新到最新版本吗？\n\n更新过程中服务会短暂不可用，更新完成后需要手动重启服务。")) {
+    if (!window.confirm("确认要自动下载并更新到最新版本吗？\n\n更新过程中请勿关闭页面，更新完成后需要手动重启服务。")) {
         return;
     }
 
-    elements.settingsPerformUpdateBtn.disabled = true;
-    elements.settingsPerformUpdateBtn.textContent = "正在下载并更新…";
-    setMessage(elements.settingsUpdateMessage, "正在下载最新版本并应用更新，请耐心等待…", false);
-    if (elements.settingsCheckStatus) {
-        elements.settingsCheckStatus.textContent = "更新中（可能需要 1-2 分钟）…";
-    }
+    // 打开进度弹窗,重置 UI
+    openUpdateProgressModal();
 
     try {
-        const result = await api("/api/perform-update", { method: "POST" });
-
-        if (result.ok) {
-            elements.settingsPerformUpdateBtn.hidden = true;
-            setMessage(
-                elements.settingsUpdateMessage,
-                `${result.message || "更新完成"}\n旧版本: ${result.previous_version || "?"} → 新版本: ${result.latest_version || "?"}\n\n请重启服务使更新生效。`,
-                false
-            );
-            if (elements.settingsCheckStatus) {
-                elements.settingsCheckStatus.textContent = "更新完成，请重启服务";
+        const response = await fetch("/api/perform-update", {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "X-API-Key": state.apiKey || ""
             }
-        } else {
-            setMessage(elements.settingsUpdateMessage, result.error || "更新失败", true);
+        });
+
+        if (!response.ok && !response.body) {
+            const text = await response.text().catch(() => "");
+            showUpdateError(`HTTP ${response.status}`, text || `服务端返回 ${response.status} 错误`, "");
+            return;
+        }
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split("\n");
+            buffer = lines.pop();  // 保留最后一行(可能不完整)
+            for (const line of lines) {
+                const trimmed = line.trim();
+                if (!trimmed) continue;
+                try {
+                    const data = JSON.parse(trimmed);
+                    handleUpdateProgressEvent(data);
+                } catch (e) {
+                    // 忽略无法解析的行
+                }
+            }
+        }
+        // 处理 buffer 中剩余的最后一行
+        if (buffer.trim()) {
+            try {
+                const data = JSON.parse(buffer.trim());
+                handleUpdateProgressEvent(data);
+            } catch (e) {}
         }
     } catch (error) {
-        setMessage(elements.settingsUpdateMessage, error.message, true);
-    } finally {
-        elements.settingsPerformUpdateBtn.disabled = false;
-        elements.settingsPerformUpdateBtn.textContent = "一键更新到新版本";
+        showUpdateError("网络错误", error.message || String(error),
+            "无法连接到服务端。可能原因：\n1) 服务已停止运行 → 请重启服务\n2) 网络问题 → 检查网络连接");
+    }
+}
+
+function openUpdateProgressModal() {
+    // 重置所有 UI 元素
+    if (elements.updateProgressFill) elements.updateProgressFill.style.width = "0%";
+    if (elements.updateProgressPercent) elements.updateProgressPercent.textContent = "0%";
+    if (elements.updateProgressStage) elements.updateProgressStage.textContent = "准备中…";
+    if (elements.updateProgressTitle) elements.updateProgressTitle.textContent = "正在更新";
+    if (elements.updateProgressSubtitle) elements.updateProgressSubtitle.textContent = "请勿关闭页面";
+    if (elements.updateProgressCloseBtn) elements.updateProgressCloseBtn.hidden = true;
+    if (elements.updateProgressCancelBtn) {
+        elements.updateProgressCancelBtn.textContent = "取消";
+        elements.updateProgressCancelBtn.disabled = false;
+    }
+    if (elements.updateVersionInfo) elements.updateVersionInfo.hidden = true;
+    if (elements.updateSkippedFiles) elements.updateSkippedFiles.hidden = true;
+    if (elements.updateErrorBox) elements.updateErrorBox.hidden = true;
+    if (elements.updateSuccessBox) elements.updateSuccessBox.hidden = true;
+
+    if (elements.updateProgressModal) {
+        elements.updateProgressModal.hidden = false;
+        void elements.updateProgressModal.offsetWidth;
+        elements.updateProgressModal.classList.add("is-visible");
+        document.body.classList.add("modal-open");
+    }
+}
+
+function closeUpdateProgressModal() {
+    if (elements.updateProgressModal) {
+        elements.updateProgressModal.classList.remove("is-visible");
+        document.body.classList.remove("modal-open");
+        setTimeout(() => {
+            if (elements.updateProgressModal) elements.updateProgressModal.hidden = true;
+        }, 180);
+    }
+}
+
+function handleUpdateProgressEvent(data) {
+    const stage = data.stage || "";
+    const message = data.message || "";
+    const progress = typeof data.progress === "number" ? data.progress : null;
+
+    // 更新进度条
+    if (progress !== null) {
+        if (elements.updateProgressFill) {
+            elements.updateProgressFill.style.width = `${Math.min(100, Math.max(0, progress))}%`;
+        }
+        if (elements.updateProgressPercent) {
+            elements.updateProgressPercent.textContent = `${progress}%`;
+        }
+    }
+
+    // 更新阶段文字
+    if (message && elements.updateProgressStage) {
+        elements.updateProgressStage.textContent = message;
+    }
+
+    // 版本信息
+    if (data.latest_version && data.current_version) {
+        if (elements.updateVersionInfo) elements.updateVersionInfo.hidden = false;
+        if (elements.updateVersionChange) {
+            elements.updateVersionChange.textContent = `${data.current_version} → ${data.latest_version}`;
+        }
+    }
+
+    if (stage === "done") {
+        // 更新完成
+        if (elements.updateProgressTitle) elements.updateProgressTitle.textContent = "更新完成";
+        if (elements.updateProgressSubtitle) elements.updateProgressSubtitle.textContent = "请重启服务使更新生效";
+        if (elements.updateProgressCloseBtn) elements.updateProgressCloseBtn.hidden = false;
+        if (elements.updateProgressCancelBtn) {
+            elements.updateProgressCancelBtn.textContent = "关闭";
+            elements.updateProgressCancelBtn.disabled = false;
+        }
+        if (elements.updateSuccessBox) elements.updateSuccessBox.hidden = false;
+        if (elements.updateSuccessMessage && data.suggestion) {
+            elements.updateSuccessMessage.textContent = data.suggestion;
+        }
+        // 跳过的文件
+        if (data.skipped_files && data.skipped_files.length > 0) {
+            if (elements.updateSkippedFiles) elements.updateSkippedFiles.hidden = false;
+            if (elements.updateSkippedFilesList) {
+                elements.updateSkippedFilesList.innerHTML = data.skipped_files
+                    .map((f) => `<div class="skipped-file-item">${escapeHtml(String(f))}</div>`)
+                    .join("");
+            }
+        }
+        // 隐藏一键更新按钮
+        if (elements.settingsPerformUpdateBtn) elements.settingsPerformUpdateBtn.hidden = true;
+    } else if (stage === "error") {
+        // 更新失败
+        showUpdateError(data.error_type || "未知错误", message, data.suggestion || "");
+    }
+}
+
+function showUpdateError(errorType, message, suggestion) {
+    if (elements.updateProgressTitle) elements.updateProgressTitle.textContent = "更新失败";
+    if (elements.updateProgressSubtitle) elements.updateProgressSubtitle.textContent = "请查看下方错误信息和建议";
+    if (elements.updateProgressFill) elements.updateProgressFill.style.width = "0%";
+    if (elements.updateProgressFill) elements.updateProgressFill.classList.add("is-error");
+    if (elements.updateProgressPercent) elements.updateProgressPercent.textContent = "!";
+    if (elements.updateProgressCloseBtn) elements.updateProgressCloseBtn.hidden = false;
+    if (elements.updateProgressCancelBtn) {
+        elements.updateProgressCancelBtn.textContent = "关闭";
+        elements.updateProgressCancelBtn.disabled = false;
+    }
+    if (elements.updateErrorBox) elements.updateErrorBox.hidden = false;
+    if (elements.updateErrorMessage) {
+        elements.updateErrorMessage.innerHTML =
+            `<span class="error-type-tag">${escapeHtml(errorType)}</span>` +
+            `<div class="error-detail">${escapeHtml(message)}</div>`;
+    }
+    if (elements.updateErrorSuggestion) {
+        elements.updateErrorSuggestion.innerHTML = suggestion
+            ? `<span class="suggestion-label">建议操作</span><div class="suggestion-text">${escapeHtml(suggestion).replace(/\n/g, "<br>")}</div>`
+            : "";
     }
 }
 
@@ -3058,4 +3215,25 @@ if (elements.settingsCheckUpdateBtn) {
 }
 if (elements.settingsPerformUpdateBtn) {
     elements.settingsPerformUpdateBtn.addEventListener("click", performUpdate);
+}
+if (elements.updateProgressBackdrop) {
+    elements.updateProgressBackdrop.addEventListener("click", closeUpdateProgressModal);
+}
+if (elements.updateProgressCloseBtn) {
+    elements.updateProgressCloseBtn.addEventListener("click", closeUpdateProgressModal);
+}
+if (elements.updateProgressCancelBtn) {
+    elements.updateProgressCancelBtn.addEventListener("click", () => {
+        // 更新中不允许关闭(只能取消请求),完成后可以关闭
+        if (elements.updateSuccessBox && !elements.updateSuccessBox.hidden) {
+            closeUpdateProgressModal();
+        } else if (elements.updateErrorBox && !elements.updateErrorBox.hidden) {
+            closeUpdateProgressModal();
+        } else {
+            // 更新进行中,确认是否关闭
+            if (window.confirm("更新正在进行中，确定要关闭吗？关闭后更新可能中断。")) {
+                closeUpdateProgressModal();
+            }
+        }
+    });
 }
