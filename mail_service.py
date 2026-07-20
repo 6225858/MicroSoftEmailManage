@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 
 from models import MailAccount
 from oauth_service import OAuthServiceError, get_valid_access_token
-from proxy_service import get_session_proxy
+from proxy_service import get_session_proxy, get_proxied_socket_factory
 
 
 logger = logging.getLogger(__name__)
@@ -744,6 +744,58 @@ def _build_xoauth2_auth_string(user: str, access_token: str) -> str:
     return f"user={user}\x01auth=Bearer {access_token}\x01\x01"
 
 
+# ── 带代理支持的 IMAP/POP3 子类 ──
+# 重写 _create_socket 方法，通过代理创建 TCP socket
+# SSL 包装由父类的 open() 方法自动完成
+
+class _ProxiedIMAP4_SSL(imaplib.IMAP4_SSL):
+    """支持代理的 IMAP4_SSL"""
+    def __init__(self, *args, socket_factory=None, **kwargs):
+        self._proxy_factory = socket_factory
+        super().__init__(*args, **kwargs)
+
+    def _create_socket(self, timeout=None):
+        if self._proxy_factory:
+            return self._proxy_factory(self.host, self.port, timeout)
+        return super()._create_socket(timeout)
+
+
+class _ProxiedIMAP4(imaplib.IMAP4):
+    """支持代理的非 SSL IMAP4"""
+    def __init__(self, *args, socket_factory=None, **kwargs):
+        self._proxy_factory = socket_factory
+        super().__init__(*args, **kwargs)
+
+    def _create_socket(self, timeout=None):
+        if self._proxy_factory:
+            return self._proxy_factory(self.host, self.port, timeout)
+        return super()._create_socket(timeout)
+
+
+class _ProxiedPOP3_SSL(poplib.POP3_SSL):
+    """支持代理的 POP3_SSL"""
+    def __init__(self, *args, socket_factory=None, **kwargs):
+        self._proxy_factory = socket_factory
+        super().__init__(*args, **kwargs)
+
+    def _create_socket(self, timeout):
+        if self._proxy_factory:
+            return self._proxy_factory(self.host, self.port, timeout)
+        return super()._create_socket(timeout)
+
+
+class _ProxiedPOP3(poplib.POP3):
+    """支持代理的非 SSL POP3"""
+    def __init__(self, *args, socket_factory=None, **kwargs):
+        self._proxy_factory = socket_factory
+        super().__init__(*args, **kwargs)
+
+    def _create_socket(self, timeout):
+        if self._proxy_factory:
+            return self._proxy_factory(self.host, self.port, timeout)
+        return super()._create_socket(timeout)
+
+
 def load_imap_messages(
     account: MailAccount,
     db: Session,
@@ -785,11 +837,22 @@ def load_imap_messages(
             tag="auth_missing",
         )
 
+    # 获取代理 socket 工厂（如果有可用代理）
+    proxy_factory = get_proxied_socket_factory(db)
+    if proxy_factory:
+        logger.info("邮箱 %s IMAP 使用代理连接 %s:%s", account.email, server, port)
+
     try:
         if use_ssl:
-            mail = imaplib.IMAP4_SSL(host=server, port=port, timeout=IMAP_TIMEOUT)
+            if proxy_factory:
+                mail = _ProxiedIMAP4_SSL(host=server, port=port, timeout=IMAP_TIMEOUT, socket_factory=proxy_factory)
+            else:
+                mail = imaplib.IMAP4_SSL(host=server, port=port, timeout=IMAP_TIMEOUT)
         else:
-            mail = imaplib.IMAP4(host=server, port=port, timeout=IMAP_TIMEOUT)
+            if proxy_factory:
+                mail = _ProxiedIMAP4(host=server, port=port, timeout=IMAP_TIMEOUT, socket_factory=proxy_factory)
+            else:
+                mail = imaplib.IMAP4(host=server, port=port, timeout=IMAP_TIMEOUT)
     except Exception as exc:
         raise MailServiceError(f"IMAP 连接失败 ({server}:{port}): {exc}") from exc
 
@@ -914,11 +977,22 @@ def load_pop3_messages(
             tag="auth_missing",
         )
 
+    # 获取代理 socket 工厂（如果有可用代理）
+    proxy_factory = get_proxied_socket_factory(db)
+    if proxy_factory:
+        logger.info("邮箱 %s POP3 使用代理连接 %s:%s", account.email, server, port)
+
     try:
         if use_ssl:
-            pop = poplib.POP3_SSL(host=server, port=port, timeout=POP3_TIMEOUT)
+            if proxy_factory:
+                pop = _ProxiedPOP3_SSL(host=server, port=port, timeout=POP3_TIMEOUT, socket_factory=proxy_factory)
+            else:
+                pop = poplib.POP3_SSL(host=server, port=port, timeout=POP3_TIMEOUT)
         else:
-            pop = poplib.POP3(host=server, port=port, timeout=POP3_TIMEOUT)
+            if proxy_factory:
+                pop = _ProxiedPOP3(host=server, port=port, timeout=POP3_TIMEOUT, socket_factory=proxy_factory)
+            else:
+                pop = poplib.POP3(host=server, port=port, timeout=POP3_TIMEOUT)
     except Exception as exc:
         raise MailServiceError(f"POP3 连接失败 ({server}:{port}): {exc}") from exc
 
@@ -959,9 +1033,15 @@ def load_pop3_messages(
                     pass
                 try:
                     if use_ssl:
-                        pop = poplib.POP3_SSL(host=server, port=port, timeout=POP3_TIMEOUT)
+                        if proxy_factory:
+                            pop = _ProxiedPOP3_SSL(host=server, port=port, timeout=POP3_TIMEOUT, socket_factory=proxy_factory)
+                        else:
+                            pop = poplib.POP3_SSL(host=server, port=port, timeout=POP3_TIMEOUT)
                     else:
-                        pop = poplib.POP3(host=server, port=port, timeout=POP3_TIMEOUT)
+                        if proxy_factory:
+                            pop = _ProxiedPOP3(host=server, port=port, timeout=POP3_TIMEOUT, socket_factory=proxy_factory)
+                        else:
+                            pop = poplib.POP3(host=server, port=port, timeout=POP3_TIMEOUT)
                 except Exception as conn_exc:
                     raise MailServiceError(
                         f"POP3 重新连接失败: {conn_exc}",

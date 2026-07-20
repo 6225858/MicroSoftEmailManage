@@ -350,3 +350,65 @@ def get_socks5_socket(proxy) -> tuple:
     if not SOCKS5_AVAILABLE or proxy.proxy_type != "socks5":
         return None
     return (proxy.host, proxy.port)
+
+
+def create_proxied_socket(proxy, target_host: str, target_port: int, timeout: int = 30):
+    """通过代理创建到目标主机的 TCP socket（不含 SSL，由调用方包装）。
+
+    支持 SOCKS5 和 HTTP 代理（HTTP 代理通过 CONNECT 隧道）。
+    需要 PySocks 库。
+
+    返回: 已连接的 socket，或 None（代理不可用时）
+    """
+    if not SOCKS5_AVAILABLE:
+        logger.warning("PySocks 未安装，IMAP/POP3 无法使用代理，将直连")
+        return None
+
+    import socks as socks_module
+
+    if proxy.proxy_type == "socks5":
+        proxy_type = socks_module.SOCKS5
+    elif proxy.proxy_type == "http":
+        proxy_type = socks_module.HTTP
+    else:
+        logger.warning("不支持的代理类型: %s，IMAP/POP3 将直连", proxy.proxy_type)
+        return None
+
+    sock = socks_module.socksocket()
+    sock.set_proxy(
+        proxy_type,
+        proxy.host,
+        proxy.port,
+        username=proxy.username or None,
+        password=proxy.password or None,
+    )
+    sock.settimeout(timeout)
+    sock.connect((target_host, target_port))
+    logger.debug(
+        "通过代理 %s:%s (%s) 连接到 %s:%s",
+        proxy.host, proxy.port, proxy.proxy_type, target_host, target_port,
+    )
+    return sock
+
+
+def get_proxied_socket_factory(db: Session):
+    """返回一个 socket 工厂函数，用于 imaplib/poplib 的 _create_socket 重写。
+
+    如果没有可用代理，返回 None（调用方应直连）。
+
+    用法:
+        factory = get_proxied_socket_factory(db)
+        # 在 IMAP4_SSL 子类中:
+        def _create_socket(self, timeout=None):
+            if factory:
+                return factory(self.host, self.port, timeout)
+            return super()._create_socket(timeout)
+    """
+    proxy = get_next_proxy(db)
+    if not proxy:
+        return None
+
+    def _factory(target_host, target_port, timeout=None):
+        return create_proxied_socket(proxy, target_host, target_port, timeout or 30)
+
+    return _factory
