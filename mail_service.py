@@ -448,6 +448,7 @@ def _load_with_protocol_selection(
 
     last_error: MailServiceError | None = None
     tried: list[str] = []
+    errors: list[str] = []  # 收集所有协议的失败原因
 
     for protocol in chain:
         # 跳过没有凭据的协议
@@ -481,6 +482,7 @@ def _load_with_protocol_selection(
             return items
         except MailServiceError as exc:
             last_error = exc
+            errors.append(f"{protocol.upper()}: {exc.message}")
             logger.warning(
                 "邮箱 %s %s 协议取件失败: %s",
                 account.email, protocol.upper(), str(exc)[:150],
@@ -488,9 +490,27 @@ def _load_with_protocol_selection(
             # 自动选择模式下：任何错误都继续尝试下一个协议
             continue
 
-    # 所有协议都失败
+    # 所有协议都失败 → 返回汇总错误(包含每个协议的失败原因)
     if last_error:
-        raise last_error
+        # 构建详细的诊断信息
+        detail = "\n".join(f"  • {e}" for e in errors)
+        suggestions = []
+        email_domain = (account.email or "").split("@")[-1].lower()
+        is_outlook = any(d in email_domain for d in ["outlook.", "hotmail.", "live.", "msn."])
+        if is_outlook:
+            suggestions.append("Outlook/Hotmail 邮箱已禁用基本密码认证，必须使用有效的 refresh_token")
+        if account.refresh_token and any("token" in e.lower() or "oauth" in e.lower() for e in errors):
+            suggestions.append("refresh_token 可能已过期或无效，请重新获取并更新")
+        if not account.refresh_token:
+            suggestions.append("未配置 refresh_token + client_id，仅靠密码可能无法通过认证")
+        if not suggestions:
+            suggestions.append("请检查邮箱密码是否正确，或网络连接是否正常")
+
+        suggestion_text = "\n建议：\n" + "\n".join(f"  {i+1}. {s}" for i, s in enumerate(suggestions))
+        raise MailServiceError(
+            f"所有取件协议均失败（尝试了 {len(tried)} 个：{', '.join(t.upper() for t in tried)}）：\n{detail}{suggestion_text}",
+            tag=last_error.tag,
+        )
     # 没有任何协议可尝试（缺凭据）
     raise MailServiceError(
         f"无可尝试的取件协议（已尝试: {tried or '无'}）",
