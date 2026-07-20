@@ -1454,10 +1454,32 @@ def perform_update():
             python_exe = sys.executable
             is_windows = platform.system() == "Windows"
 
+            def _is_running_in_docker():
+                """检测是否在 Docker 容器中运行"""
+                if os.path.exists("/.dockerenv"):
+                    return True
+                try:
+                    with open("/proc/1/cgroup", "r") as f:
+                        content = f.read()
+                        if "docker" in content or "containerd" in content:
+                            return True
+                except Exception:
+                    pass
+                return False
+
             def _delayed_restart():
                 # 等待 StreamingResponse 发送完毕
                 time.sleep(3)
                 try:
+                    # Docker 环境:直接退出主进程
+                    # docker-compose.yml 配置了 restart: unless-stopped
+                    # 容器停止后会自动重启,加载已更新的代码
+                    if _is_running_in_docker():
+                        logger.info("检测到 Docker 环境,直接退出进程,Docker restart 策略会自动重启容器")
+                        os._exit(0)
+                        return
+
+                    # 非 Docker 环境:创建重启脚本 → 启动 → 退出
                     if is_windows:
                         bat_path = os.path.join(PROJECT_ROOT, "_restart.bat")
                         bat_content = (
