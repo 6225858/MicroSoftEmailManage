@@ -397,7 +397,15 @@ _PROTOCOL_CHAIN = ["graph", "imap", "pop3"]
 def _can_use_protocol(protocol: str, account: MailAccount) -> bool:
     """检查该协议是否可执行（有相应凭据）"""
     if protocol == "graph":
-        return bool((account.refresh_token or "").strip() and (account.client_id or "").strip())
+        has_creds = bool((account.refresh_token or "").strip() and (account.client_id or "").strip())
+        if not has_creds:
+            logger.warning(
+                "邮箱 %s Graph 协议不可用: refresh_token=%s, client_id=%s",
+                account.email,
+                "有" if (account.refresh_token or "").strip() else "空",
+                "有" if (account.client_id or "").strip() else "空",
+            )
+        return has_creds
     if protocol in ("imap", "pop3"):
         return bool((account.password or "").strip())
     return False
@@ -485,6 +493,21 @@ def _load_with_protocol_selection(
         suggestions = []
         email_domain = (account.email or "").split("@")[-1].lower()
         is_outlook = any(d in email_domain for d in ["outlook.", "hotmail.", "live.", "msn."])
+
+        # 检查是否有连接超时错误（IP 限制）
+        has_timeout = any("timed out" in e.lower() or "timeout" in e.lower() for e in errors)
+        # 检查 Graph API 是否被尝试
+        graph_tried = "graph" in tried
+
+        if has_timeout and is_outlook:
+            suggestions.append(
+                "Outlook/Hotmail 的 IMAP/POP3 服务器(outlook.office365.com)连接超时，"
+                "很可能是因为服务器 IP 被微软限制。请在「代理管理」中配置 SOCKS5 或 HTTP 代理"
+            )
+        if is_outlook and not graph_tried:
+            suggestions.append(
+                "Graph API 未被尝试，请确认账号已正确导入 refresh_token 和 client_id"
+            )
         if is_outlook:
             suggestions.append("Outlook/Hotmail 邮箱已禁用基本密码认证，必须使用有效的 refresh_token")
         if account.refresh_token and any("token" in e.lower() or "oauth" in e.lower() for e in errors):
