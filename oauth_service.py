@@ -285,27 +285,12 @@ def get_valid_access_token(account: MailAccount, db: Session) -> str:
     proxies = get_session_proxy(db, account)
 
     last_error: OAuthServiceError | None = None
+    is_msauth = _is_msauth_token(account.refresh_token)
 
-    # 优先尝试 MSAuth 端点（仅当 refresh_token 是 MSAuth 格式时）
-    # 注意：MSAuth 端点对 Graph scope 的授权要求比较严格，部分 client_id 会返回
-    # "scope unauthorized or expired"。这种情况下 fallback 到标准 OAuth2 端点。
-    if _is_msauth_token(account.refresh_token):
-        logger.info("邮箱 %s 检测到 MSAuth 格式令牌，使用 MSAuth 端点刷新", account.email)
-        try:
-            payload = _try_msauth_refresh(account, proxies)
-            access_token = payload["access_token"]
-            new_refresh_token = _sanitize_token(str(payload.get("refresh_token") or ""))
-            _store_tokens(account, db, access_token, new_refresh_token, now)
-            return access_token
-        except OAuthServiceError as exc:
-            last_error = exc
-            logger.warning(
-                "邮箱 %s MSAuth 刷新失败，fallback 到标准 OAuth2 端点: %s",
-                account.email, str(exc)[:200],
-            )
-
-    # 标准 OAuth2 端点：consumers / common
-    # 即使 refresh_token 是 MSAuth 格式，标准端点也常常可以接受（取决于 client_id 类型）
+    # 优先尝试标准 OAuth2 端点（获取含 Mail.Read scope 的 JWT token）
+    # 标准 OAuth2 端点返回的 token 同时适用于 Graph API 和 IMAP XOAUTH2，
+    # 这样即使没有代理（IMAP 直连被 IP 限制），Graph API 也能正常取件。
+    # 即使 refresh_token 是 MSAuth 格式(M.C开头)，标准端点也常常可以接受。
     for token_url in (TOKEN_URL_CONSUMER, TOKEN_URL_COMMON):
         try:
             payload = _try_oauth2_refresh(token_url, account, proxies)
@@ -316,6 +301,24 @@ def get_valid_access_token(account: MailAccount, db: Session) -> str:
         except OAuthServiceError as exc:
             last_error = exc
             logger.warning("邮箱 %s 端点 %s 刷新失败: %s", account.email, token_url, str(exc)[:200])
+
+    # 标准 OAuth2 端点全部失败 → 尝试 MSAuth 端点（仅 M.C 格式 token）
+    # MSAuth 端点返回的 token 只有 wl.imap scope，不能用于 Graph API，
+    # 但可以用于 IMAP XOAUTH2 认证（需要配合代理使用，否则直连可能被 IP 限制）
+    if is_msauth:
+        logger.info("邮箱 %s 标准 OAuth2 端点失败，尝试 MSAuth 端点刷新", account.email)
+        try:
+            payload = _try_msauth_refresh(account, proxies)
+            access_token = payload["access_token"]
+            new_refresh_token = _sanitize_token(str(payload.get("refresh_token") or ""))
+            _store_tokens(account, db, access_token, new_refresh_token, now)
+            return access_token
+        except OAuthServiceError as exc:
+            last_error = exc
+            logger.warning(
+                "邮箱 %s MSAuth 端点刷新也失败: %s",
+                account.email, str(exc)[:200],
+            )
 
     logger.error("邮箱 %s OAuth 刷新失败（所有端点均失败）", account.email)
     raise last_error or OAuthServiceError("unknown token refresh error")
