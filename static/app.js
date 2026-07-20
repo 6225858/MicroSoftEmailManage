@@ -227,6 +227,8 @@ const elements = {
     refreshLogPaginationSummary: document.getElementById("refresh-log-pagination-summary"),
     refreshLogPageSize: document.getElementById("refresh-log-page-size"),
     refreshLogRunBtn: document.getElementById("refresh-log-run-btn"),
+    refreshLogExpandAllBtn: document.getElementById("refresh-log-expand-all-btn"),
+    refreshLogCollapseAllBtn: document.getElementById("refresh-log-collapse-all-btn"),
     // 设置页面
     settingsCurrentVersion: document.getElementById("settings-current-version"),
     settingsGithubRepoInput: document.getElementById("settings-github-repo-input"),
@@ -1287,6 +1289,8 @@ function renderRefreshLogs() {
 
     elements.refreshLogList.innerHTML = state.tokenRefreshLogs.map((log) => {
         const failureItems = Array.isArray(log.failure_items) ? log.failure_items : [];
+        const failedCount = Number(log.failed_count || 0);
+        const hasFailures = failedCount > 0;
         const failureMarkup = failureItems.length
             ? failureItems.map((item) => `
                 <div class="refresh-log-failure">
@@ -1298,67 +1302,37 @@ function renderRefreshLogs() {
         const triggerLabel = log.trigger_type === "scheduled"
             ? text.refreshLogsScheduled
             : text.refreshLogsManual;
-        const statusClass = Number(log.failed_count) > 0 ? " is-partial" : " is-success";
+        const statusClass = hasFailures ? " is-partial" : " is-success";
+        // 有失败时默认展开，无失败时默认折叠
+        const collapseClass = hasFailures ? "" : " is-collapsed";
         const previewButtonMarkup = log.has_html
             ? `<button class="button button-ghost refresh-log-preview-btn" type="button" data-preview-log-id="${Number(log.id)}">${escapeHtml(text.refreshLogsPreview)}</button>`
             : "";
+        const failBadge = hasFailures
+            ? `<span class="refresh-log-fail-badge has-failures">${failedCount} 失败</span>`
+            : `<span class="refresh-log-fail-badge all-success">全部成功</span>`;
 
         return `
-            <article class="refresh-log-card${statusClass}">
+            <article class="refresh-log-card${statusClass}${collapseClass}">
                 <div class="refresh-log-card-head">
-                    <span class="pill">${escapeHtml(triggerLabel)}</span>
-                    <span class="refresh-log-duration">${escapeHtml(text.refreshLogsDuration)}：${escapeHtml(formatDuration(log.duration_seconds))}</span>
+                    <div class="refresh-log-card-head-left">
+                        <span class="pill">${escapeHtml(triggerLabel)}</span>
+                        <span class="refresh-log-duration">${escapeHtml(text.refreshLogsDuration)}: ${escapeHtml(formatDuration(log.duration_seconds))}</span>
+                    </div>
+                    <div class="refresh-log-card-head-left">
+                        ${failBadge}
+                        <button class="refresh-log-toggle" type="button" data-toggle="collapse" aria-label="展开/收起">▼</button>
+                    </div>
                 </div>
                 <h3>${escapeHtml(text.refreshLogsSuccessSummary(log.success_count, log.total_count))}</h3>
-                <div class="refresh-log-failures">${failureMarkup}</div>
-                <div class="refresh-log-time">
-                    <span>${escapeHtml(text.refreshLogsExecutionTime)}：</span>
-                    <time>${escapeHtml(formatDateTime(log.finished_at || log.started_at || log.created_at))}</time>
+                <div class="refresh-log-card-body">
+                    <div class="refresh-log-failures">${failureMarkup}</div>
+                    <div class="refresh-log-time">
+                        <span>${escapeHtml(text.refreshLogsExecutionTime)}:</span>
+                        <time>${escapeHtml(formatDateTime(log.finished_at || log.started_at || log.created_at))}</time>
+                    </div>
+                    <div class="refresh-log-actions">${previewButtonMarkup}</div>
                 </div>
-            </article>
-        `;
-    }).join("");
-}
-
-function renderRefreshLogs() {
-    renderRefreshLogPagination();
-
-    if (!state.tokenRefreshLogs.length) {
-        elements.refreshLogList.innerHTML = `<div class="empty-state">${text.refreshLogsEmpty}</div>`;
-        return;
-    }
-
-    elements.refreshLogList.innerHTML = state.tokenRefreshLogs.map((log) => {
-        const failureItems = Array.isArray(log.failure_items) ? log.failure_items : [];
-        const failureMarkup = failureItems.length
-            ? failureItems.map((item) => `
-                <div class="refresh-log-failure">
-                    <strong>${escapeHtml(item.email || "-")}</strong>
-                    <span>${escapeHtml(item.error || "-")}</span>
-                </div>
-            `).join("")
-            : `<div class="refresh-log-failure is-empty">${escapeHtml(text.refreshLogsFailureNone)}</div>`;
-        const triggerLabel = log.trigger_type === "scheduled"
-            ? text.refreshLogsScheduled
-            : text.refreshLogsManual;
-        const statusClass = Number(log.failed_count) > 0 ? " is-partial" : " is-success";
-        const previewButtonMarkup = log.has_html
-            ? `<button class="button button-ghost refresh-log-preview-btn" type="button" data-preview-log-id="${Number(log.id)}">${escapeHtml(text.refreshLogsPreview)}</button>`
-            : "";
-
-        return `
-            <article class="refresh-log-card${statusClass}">
-                <div class="refresh-log-card-head">
-                    <span class="pill">${escapeHtml(triggerLabel)}</span>
-                    <span class="refresh-log-duration">${escapeHtml(text.refreshLogsDuration)}: ${escapeHtml(formatDuration(log.duration_seconds))}</span>
-                </div>
-                <h3>${escapeHtml(text.refreshLogsSuccessSummary(log.success_count, log.total_count))}</h3>
-                <div class="refresh-log-failures">${failureMarkup}</div>
-                <div class="refresh-log-time">
-                    <span>${escapeHtml(text.refreshLogsExecutionTime)}:</span>
-                    <time>${escapeHtml(formatDateTime(log.finished_at || log.started_at || log.created_at))}</time>
-                </div>
-                <div class="refresh-log-actions">${previewButtonMarkup}</div>
             </article>
         `;
     }).join("");
@@ -2442,11 +2416,31 @@ elements.refreshLogPageSize.addEventListener("change", async () => {
     await loadTokenRefreshLogs();
 });
 elements.refreshLogList.addEventListener("click", (event) => {
+    // 折叠/展开切换
+    const toggleBtn = event.target.closest("[data-toggle='collapse']");
+    if (toggleBtn) {
+        const card = toggleBtn.closest(".refresh-log-card");
+        if (card) {
+            card.classList.toggle("is-collapsed");
+        }
+        return;
+    }
+    // 预览按钮
     const button = event.target.closest("[data-preview-log-id]");
     if (!button) {
         return;
     }
     openRefreshLogPreview(Number(button.dataset.previewLogId));
+});
+elements.refreshLogExpandAllBtn.addEventListener("click", () => {
+    elements.refreshLogList.querySelectorAll(".refresh-log-card").forEach((card) => {
+        card.classList.remove("is-collapsed");
+    });
+});
+elements.refreshLogCollapseAllBtn.addEventListener("click", () => {
+    elements.refreshLogList.querySelectorAll(".refresh-log-card").forEach((card) => {
+        card.classList.add("is-collapsed");
+    });
 });
 elements.mailStepButtons.forEach((button) => {
     button.addEventListener("click", () => {
