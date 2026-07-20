@@ -55,8 +55,8 @@ DETAIL_SELECT = "id,subject,from,toRecipients,ccRecipients,bccRecipients,replyTo
 
 # 请求超时（秒）
 GRAPH_TIMEOUT = 30
-IMAP_TIMEOUT = 30
-POP3_TIMEOUT = 30
+IMAP_TIMEOUT = 15
+POP3_TIMEOUT = 15
 
 
 class MailServiceError(Exception):

@@ -800,36 +800,39 @@ def get_account_mails(
             "refreshing": is_refreshing(account_id, folder),
         }
 
-    # 3. 无缓存 → 实时拉取（首次会慢一点）
-    try:
-        items = load_account_mails(account, db, folder=folder, limit=limit)
-        save_mail_cache(db, account_id, folder, items)
-        return {"items": items, "cached": False, "updated_at": int(time.time())}
-    except MailServiceError as exc:
-        if cached:
+    # 3. 无缓存 → 触发后台异步刷新
+    # 之前是同步调用 load_account_mails，M.C 格式 token 无代理时
+    # IMAP+POP3 各超时 15s = 30s 阻塞，前端一直显示"正在加载邮件..."
+    refresh_mail_cache_async(account_id, folder, limit)
+
+    # 如果调用方要求等待，阻塞最多 30 秒等后台刷新完成
+    if wait:
+        task = wait_for_refresh(account_id, folder, timeout=30)
+        db.expire_all()
+        cached_after = get_mail_cache(db, account_id, folder)
+        if cached_after and cached_after["items"]:
             return {
-                "items": cached["items"],
+                "items": cached_after["items"],
                 "cached": True,
-                "stale": True,
-                "updated_at": cached["updated_at"],
-                "refresh_error": exc.message,
+                "updated_at": cached_after["updated_at"],
+                "is_fresh": cached_after["is_fresh"],
+                "refresh_error": task.error if task else None,
             }
-        # 无缓存 + 实时拉取失败:如果后台正在刷新,等最多 30 秒,可能等到结果
-        if is_refreshing(account_id, folder):
-            try:
-                wait_for_refresh(account_id, folder, timeout=30)
-                db.expire_all()
-                cached_after = get_mail_cache(db, account_id, folder)
-                if cached_after and cached_after["items"]:
-                    return {
-                        "items": cached_after["items"],
-                        "cached": True,
-                        "updated_at": cached_after["updated_at"],
-                        "is_fresh": cached_after["is_fresh"],
-                    }
-            except Exception:  # noqa: BLE001
-                pass
-        raise HTTPException(status_code=400, detail=exc.message)
+        # 刷新完成但仍无邮件（或刷新失败）
+        return {
+            "items": [],
+            "cached": False,
+            "refreshing": False,
+            "refresh_error": task.error if task else None,
+        }
+
+    # 不等待，立即返回（前端会通过 fetchMailsWithWait 轮询）
+    return {
+        "items": [],
+        "cached": False,
+        "refreshing": True,
+        "updated_at": int(time.time()),
+    }
 
 
 @app.post("/api/accounts/{account_id}/mails/refresh", dependencies=[Depends(require_api_key)])

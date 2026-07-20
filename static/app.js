@@ -439,19 +439,32 @@ text.proxyImportFormats = [
 ];
 
 async function api(path, options = {}) {
-    const response = await fetch(path, {
-        ...options,
-        headers: {
-            "Content-Type": "application/json",
-            ...(options.headers || {})
-        }
-    });
+    // 30 秒超时，防止后端长时间阻塞导致前端一直显示"正在加载..."
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 30000);
+    try {
+        const response = await fetch(path, {
+            ...options,
+            headers: {
+                "Content-Type": "application/json",
+                ...(options.headers || {})
+            },
+            signal: controller.signal,
+        });
 
-    const data = await response.json().catch(() => ({}));
-    if (!response.ok) {
-        throw new Error(data.detail || text.requestFailed);
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+            throw new Error(data.detail || text.requestFailed);
+        }
+        return data;
+    } catch (error) {
+        if (error.name === "AbortError") {
+            throw new Error("请求超时（30秒），请检查网络或代理配置");
+        }
+        throw error;
+    } finally {
+        clearTimeout(timeoutId);
     }
-    return data;
 }
 
 function escapeHtml(value) {
@@ -1658,6 +1671,13 @@ async function loadMails({ silent = false } = {}) {
     }
 
     if (requestId !== state.mailLoadRequestId || state.selectedAccountId !== accountId || state.selectedFolder !== folder) {
+        return;
+    }
+
+    // 无缓存但后台正在刷新 → 等待刷新完成
+    if (!data.cached && data.refreshing) {
+        setMessage(elements.mailMessage, "首次加载，正在后台拉取邮件...", false);
+        await fetchMailsWithWait({ silent: true, requestId, accountId, folder });
         return;
     }
 
