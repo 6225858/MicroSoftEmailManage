@@ -80,6 +80,19 @@ def compare_versions(v1: str, v2: str) -> int:
         if p1 < p2:
             return -1
     return 0
+
+
+def get_current_version() -> str:
+    """获取当前已安装版本号。
+
+    优先使用 settings.json 中的 installed_version(由 perform_update 写入),
+    其次用代码中的 APP_VERSION 常量。
+    这样即使 GitHub Release 的 tag 与代码中的 APP_VERSION 不一致,
+    更新后 installed_version 会被设为 Release tag,版本号能正确更新。
+    """
+    settings = load_settings()
+    installed = (settings.get("installed_version") or "").strip()
+    return installed if installed else APP_VERSION
 from token_refresh_service import (
     ALLOWED_PAGE_SIZES,
     TokenRefreshTaskRunningError,
@@ -1156,7 +1169,7 @@ def get_version():
     """返回当前应用版本号和已配置的 GitHub 仓库地址"""
     settings = load_settings()
     return {
-        "version": APP_VERSION,
+        "version": get_current_version(),
         "github_repo": settings.get("github_repo", "") or DEFAULT_GITHUB_REPO,
     }
 
@@ -1214,11 +1227,11 @@ def check_update():
         release_name = data.get("name") or ""
         published_at = data.get("published_at") or ""
 
-        has_update = compare_versions(latest_version, APP_VERSION) > 0
+        has_update = compare_versions(latest_version, get_current_version()) > 0
 
         return {
             "has_update": has_update,
-            "current_version": APP_VERSION,
+            "current_version": get_current_version(),
             "latest_version": latest_version,
             "release_url": release_url,
             "release_notes": release_notes,
@@ -1315,13 +1328,13 @@ def perform_update():
                             error_type="parse_error", suggestion="请在 GitHub Release 中设置正确的 tag（如 v1.0.1）")
                 return
 
-            if compare_versions(latest_version, APP_VERSION) <= 0:
-                yield _emit("error", f"当前版本 {APP_VERSION} 已是最新（最新 Release: {latest_version}）", 15,
+            if compare_versions(latest_version, get_current_version()) <= 0:
+                yield _emit("error", f"当前版本 {get_current_version()} 已是最新（最新 Release: {latest_version}）", 15,
                             error_type="up_to_date", suggestion="无需更新")
                 return
 
-            yield _emit("version_checked", f"发现新版本 {latest_version}（当前 {APP_VERSION}）", 20,
-                        latest_version=latest_version, current_version=APP_VERSION)
+            yield _emit("version_checked", f"发现新版本 {latest_version}（当前 {get_current_version()}）", 20,
+                        latest_version=latest_version, current_version=get_current_version())
 
             # ── 阶段 2: 下载源码 zip ──
             zipball_url = release_data.get("zipball_url") or f"https://github.com/{github_repo}/archive/refs/tags/{release_data.get('tag_name', '')}.zip"
@@ -1439,11 +1452,17 @@ def perform_update():
                         shutil.rmtree(os.path.join(root, d), ignore_errors=True)
 
             yield _emit("done", "更新完成，正在准备重启服务…", 100,
-                        previous_version=APP_VERSION,
+                        previous_version=get_current_version(),
                         latest_version=latest_version,
                         release_url=release_url,
                         skipped_files=skipped_files,
                         suggestion="请重启服务使更新生效（关闭当前命令行窗口，重新执行 python icutool_mail.py）")
+
+            # 把新版本号写入 settings.json,这样即使代码中的 APP_VERSION 没同步更新,
+            # check_update 也能正确识别为已安装最新版本
+            update_settings = load_settings()
+            update_settings["installed_version"] = latest_version
+            save_settings(update_settings)
 
             # ── 自动重启 ──
             # 启动守护线程:等待响应发送完毕 → 启动重启脚本 → 退出当前进程
@@ -1527,7 +1546,7 @@ def perform_update():
                     logger.warning("自动重启失败: %s,请手动重启服务", exc)
 
             yield _emit("restarting", "正在重启服务…（服务将短暂不可用，页面会自动刷新）", 100,
-                        previous_version=APP_VERSION,
+                        previous_version=get_current_version(),
                         latest_version=latest_version)
 
             threading.Thread(target=_delayed_restart, daemon=True).start()
