@@ -18,7 +18,7 @@ from pydantic import BaseModel
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
-from database import Base, SessionLocal, engine
+from database import Base, SessionLocal, engine, DATABASE_PATH
 from mail_service import MailServiceError, load_account_mails, list_account_folders, load_single_mail, list_account_folders_with_protocol, load_single_mail_with_protocol
 from mail_cache_service import (
     get_mail_cache,
@@ -103,6 +103,46 @@ from token_refresh_service import (
 )
 
 Base.metadata.create_all(bind=engine)
+
+
+def _run_migrations() -> None:
+    """自动给已存在的表添加缺失的列(简单的 schema 迁移)。
+
+    SQLAlchemy 的 create_all 只会创建新表,不会给已存在的表添加新列。
+    旧版本数据库升级到新版本时需要手动 ALTER TABLE,这里自动完成。
+    每个迁移都是幂等的:列已存在时跳过。
+    """
+    import sqlite3
+    migrations = [
+        # (table, column, column_def)
+        ("mail_account", "last_used_protocol", "VARCHAR(20) DEFAULT ''"),
+        ("mail_account", "mail_server", "VARCHAR(255) DEFAULT ''"),
+        ("mail_account", "mail_port", "INTEGER DEFAULT 0"),
+        ("mail_account", "mail_use_ssl", "INTEGER DEFAULT 1"),
+        ("mail_account", "remark", "TEXT DEFAULT ''"),
+        ("mail_account", "cached_access_token", "TEXT DEFAULT ''"),
+        ("mail_account", "access_token_expire_time", "INTEGER DEFAULT 0"),
+    ]
+
+    conn = sqlite3.connect(DATABASE_PATH)
+    try:
+        cursor = conn.cursor()
+        for table, column, column_def in migrations:
+            # 检查列是否已存在
+            cursor.execute(f"PRAGMA table_info({table})")
+            existing_columns = {row[1] for row in cursor.fetchall()}
+            if column not in existing_columns:
+                logger.info("数据库迁移: 给 %s 表添加 %s 列", table, column)
+                cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_def}")
+        conn.commit()
+    except Exception as exc:
+        logger.warning("数据库迁移失败: %s", exc)
+        conn.rollback()
+    finally:
+        conn.close()
+
+
+_run_migrations()
 
 
 class ImportBody(BaseModel):
