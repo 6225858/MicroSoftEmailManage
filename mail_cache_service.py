@@ -113,6 +113,27 @@ def is_refreshing(account_id: int, folder: str) -> bool:
         return key in _refresh_tasks
 
 
+def cancel_refresh_for_account(account_id: int) -> int:
+    """取消指定账号的所有后台刷新任务（所有文件夹）。
+
+    返回取消的任务数量。
+    注意：正在运行的 worker 线程无法真正中断（IMAP/POP3 连接在阻塞中），
+    但会立即从 _refresh_tasks 中移除，使 is_refreshing 返回 False，
+    且等待者会立即收到 "cancelled" 错误。
+    worker 线程完成后会发现账号已删除，跳过 save_mail_cache。
+    """
+    cancelled = 0
+    with _refresh_lock:
+        keys_to_remove = [k for k in _refresh_tasks if k[0] == account_id]
+        for key in keys_to_remove:
+            task = _refresh_tasks.pop(key)
+            task.done(error="cancelled")
+            cancelled += 1
+    if cancelled:
+        logger.info("已取消账号 %d 的 %d 个后台刷新任务", account_id, cancelled)
+    return cancelled
+
+
 def get_active_refresh(account_id: int, folder: str) -> Optional["RefreshTask"]:
     """获取正在进行的刷新任务，没有则返回 None。"""
     key = (account_id, folder)
@@ -177,12 +198,18 @@ def refresh_mail_cache_async(
                     error_msg = "account not found"
                 else:
                     items = load_account_mails(account, db, folder=folder, limit=limit)
-                    save_mail_cache(db, account_id, folder, items)
-                    item_count = len(items)
-                    logger.info(
-                        "后台刷新邮件缓存完成: %s/%s (%d封)",
-                        account.email, folder, item_count,
-                    )
+                    # 检查账号是否在取件过程中被删除
+                    db.expire_all()
+                    if not db.query(MailAccount).filter(MailAccount.id == account_id).first():
+                        logger.info("账号 %d 在刷新过程中被删除，跳过保存缓存", account_id)
+                        error_msg = "account deleted during refresh"
+                    else:
+                        save_mail_cache(db, account_id, folder, items)
+                        item_count = len(items)
+                        logger.info(
+                            "后台刷新邮件缓存完成: %s/%s (%d封)",
+                            account.email, folder, item_count,
+                        )
         except MailServiceError as exc:
             error_msg = exc.message
             logger.warning(

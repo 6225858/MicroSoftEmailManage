@@ -27,6 +27,7 @@ from mail_cache_service import (
     refresh_mail_cache_sync,
     wait_for_refresh,
     is_refreshing,
+    cancel_refresh_for_account,
 )
 from models import ApiKey, MailAccount, MailCache, Proxy, TokenRefreshLog
 from oauth_service import OAuthServiceError, get_valid_access_token
@@ -383,6 +384,9 @@ def delete_account(account_id: int, db: Session = Depends(get_db)):
     if account is None:
         raise HTTPException(status_code=404, detail="account not found")
 
+    # 先取消该账号的后台刷新任务（避免 IMAP/POP3 连接持有数据库锁）
+    cancel_refresh_for_account(account_id)
+
     # 删除账号前清理其所有文件夹的邮件缓存
     db.query(MailCache).filter(MailCache.account_id == account_id).delete(synchronize_session=False)
 
@@ -398,6 +402,11 @@ def batch_delete_accounts(body: BatchDeleteBody, db: Session = Depends(get_db)):
         return {"ok": True, "deleted": 0, "missing": []}
 
     ids_to_delete = list(dict.fromkeys(body.ids))  # 去重保序
+
+    # 先取消所有待删账号的后台刷新任务（避免 IMAP/POP3 连接持有数据库锁）
+    for aid in ids_to_delete:
+        cancel_refresh_for_account(aid)
+
     accounts = (
         db.query(MailAccount)
         .filter(MailAccount.id.in_(ids_to_delete))

@@ -1128,7 +1128,10 @@ async function confirmDeleteAccounts() {
             : text.bulkDeleteSuccess(result.deleted);
         setMessage(elements.accountMessage, message, false);
 
-        await loadAccounts();
+        // 优化：直接从本地状态移除已删除账号，不重新请求服务器
+        const deletedSet = new Set(ids);
+        state.accounts = state.accounts.filter((a) => !deletedSet.has(a.id));
+        updateTagFilterOptions();
         renderAccounts();
     } catch (error) {
         setMessage(elements.deleteConfirmMessage, error.message, true);
@@ -1154,7 +1157,9 @@ async function deleteSingleAccount(accountId) {
         updateSelectedAccountSummary();
         resetMailView({ invalidateRequest: true });
         setMessage(elements.accountMessage, text.deleteSingleSuccess, false);
-        await loadAccounts();
+        // 优化：直接从本地状态移除，不重新请求服务器
+        state.accounts = state.accounts.filter((a) => a.id !== accountId);
+        updateTagFilterOptions();
         renderAccounts();
     } catch (error) {
         setMessage(elements.accountMessage, error.message, true);

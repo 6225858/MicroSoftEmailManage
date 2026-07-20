@@ -2,7 +2,7 @@ import os
 import logging
 from pathlib import Path
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 
@@ -53,7 +53,20 @@ logger.info("数据库文件路径: %s", DATABASE_PATH)
 
 engine = create_engine(
     DATABASE_URL,
-    connect_args={"check_same_thread": False},
+    connect_args={"check_same_thread": False, "timeout": 30},
+    pool_pre_ping=True,
 )
+
+
+# 启用 WAL 模式：读写不互斥，解决后台刷新任务持读锁时删除操作被阻塞的问题
+# 非 WAL 模式下：SELECT 持共享锁 → DELETE 的排他锁被阻塞 → 必须等后台任务(15-30s)完成
+# WAL 模式下：读不阻塞写，写不阻塞读，只有写阻塞写
+@event.listens_for(engine, "connect")
+def _set_sqlite_pragma(dbapi_conn, _conn_record):
+    cursor = dbapi_conn.cursor()
+    cursor.execute("PRAGMA journal_mode=WAL")
+    cursor.execute("PRAGMA busy_timeout=30000")  # 30 秒等待锁
+    cursor.execute("PRAGMA synchronous=NORMAL")  # WAL 模式下 NORMAL 足够安全且更快
+    cursor.close()
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
