@@ -913,25 +913,49 @@ def load_pop3_messages(
                 pop._shortcmd(f"AUTH XOAUTH2 {encoded_auth}")
                 logger.info("邮箱 %s POP3 XOAUTH2 认证成功", account.email)
             except poplib.error_proto as exc:
-                # XOAUTH2 失败时如果有密码，fallback 到密码认证
-                if password:
-                    logger.warning(
-                        "邮箱 %s POP3 XOAUTH2 认证失败，回退到密码认证: %s",
-                        account.email, str(exc)[:150],
-                    )
-                    try:
-                        pop.user(account.email)
-                        pop.pass_(password)
-                    except poplib.error_proto as exc2:
-                        raise MailServiceError(
-                            f"POP3 login failed: {exc2}",
-                            tag="pop3_auth_failed",
-                        ) from exc2
-                else:
+                # XOAUTH2 失败:服务器可能返回 continuation response(+ <base64_error>)
+                # 必须发送空行清除 continuation 状态,否则连接处于脏状态
+                try:
+                    pop.sock.sendall(b"\r\n")
+                    pop.file.readline()
+                except Exception:
+                    pass
+
+                if not password:
                     raise MailServiceError(
                         f"POP3 XOAUTH2 login failed: {exc}",
                         tag="pop3_auth_failed",
                     ) from exc
+
+                # 有密码 → 关闭旧连接,重新连接后用密码认证
+                # (不能在旧连接上直接 USER/PASS,因为 XOAUTH2 失败后连接状态已脏)
+                logger.warning(
+                    "邮箱 %s POP3 XOAUTH2 认证失败(%s),重新连接后用密码认证",
+                    account.email, str(exc)[:120],
+                )
+                try:
+                    pop.quit()
+                except Exception:
+                    pass
+                try:
+                    if use_ssl:
+                        pop = poplib.POP3_SSL(host=server, port=port, timeout=POP3_TIMEOUT)
+                    else:
+                        pop = poplib.POP3(host=server, port=port, timeout=POP3_TIMEOUT)
+                except Exception as conn_exc:
+                    raise MailServiceError(
+                        f"POP3 重新连接失败: {conn_exc}",
+                        tag="pop3_auth_failed",
+                    ) from conn_exc
+                try:
+                    pop.user(account.email)
+                    pop.pass_(password)
+                    logger.info("邮箱 %s POP3 密码认证成功", account.email)
+                except poplib.error_proto as exc2:
+                    raise MailServiceError(
+                        f"POP3 login failed: {exc2}",
+                        tag="pop3_auth_failed",
+                    ) from exc2
         else:
             try:
                 pop.user(account.email)
