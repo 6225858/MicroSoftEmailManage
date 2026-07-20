@@ -1,14 +1,22 @@
 services:
   mail-manager:
+    image: ms-email-manager:latest
     build: .
     container_name: ms-email-manager
     ports:
       - "10019:10019"
     environment:
-      - ADMIN_PASSWORD=admin123
+      - DATA_DIR=/app/data
+      - TZ=Asia/Shanghai
     volumes:
-      - mail-data:/app
+      # 持久化数据库文件（重要！防止容器删除后数据丢失）
+      - ./data:/app/data
+      # 持久化导出的邮件报告HTML
+      - ./html:/app/html
     restart: unless-stopped
-
-volumes:
-  mail-data:
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:10019/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s

@@ -36,15 +36,19 @@
 - 需要给邮箱做标签分类和业务备注
 - 需要定期维护 OAuth 令牌，减少令牌失效带来的人工处理
 - 需要在一个简单后台里快速查看收件箱和垃圾箱邮件
+- 同一批次中混合使用 Graph API / IMAP / POP3 三种协议取件
 
 ## 功能概览
 
 ### 1. 邮箱批量导入
 
-支持按行粘贴导入，格式如下：
+支持按行粘贴导入，并支持 **TXT/CSV 文件** 直接读取：
 
 ```text
-邮箱----密码----client_id----refresh_token
+邮箱----密码----client_id----refresh_token           （Graph API，默认）
+邮箱----密码----client_id----refresh_token----imap     （切换为 IMAP 协议）
+邮箱----密码                                          （IMAP / POP3 协议，仅密码）
+邮箱----密码----client_id----refresh_token----pop3----outlook.office365.com:995
 ```
 
 示例：
@@ -52,13 +56,18 @@
 ```text
 abc@hotmail.com----123456----clientidxxxx----refresh_token_xxx
 abc2@hotmail.com----123456----clientidxxxx----refresh_token_xxx
+imap1@hotmail.com----mypassword----   ← IMAP / POP3 协议，只有邮箱和密码
 ```
+
+导入时可在页面上选择默认协议（`Graph API` / `IMAP` / `POP3`），未指定时默认 `graph`。
+IMAP / POP3 协议下，可在导入时一并设置邮件服务器（默认 `outlook.office365.com`）和 SSL 选项。
 
 导入时会自动区分：
 
 - 新账号：插入数据库
-- 已存在账号：更新密码、`client_id`、`refresh_token`
+- 已存在账号：更新密码、`client_id`、`refresh_token`、协议与服务器配置
 - 格式不正确的行：自动跳过
+- 旧账号重新导入时，会自动清空缓存的 `access_token`，避免旧 `scope`（如 IMAP scope）的 token 被复用，从根因上避免 `User is authenticated but not connected` 错误
 
 ### 2. 标签管理
 
@@ -129,7 +138,7 @@ abc2@hotmail.com----123456----clientidxxxx----refresh_token_xxx
 - 数据库：`SQLite`
 - ORM：`SQLAlchemy`
 - OAuth 请求：`requests`
-- 邮件协议：`IMAP + XOAUTH2`
+- 邮件协议：`Microsoft Graph API`（默认）/ `IMAP4` / `POP3`
 - 运行服务：`uvicorn`
 
 ## 项目结构
@@ -159,27 +168,13 @@ abc2@hotmail.com----123456----clientidxxxx----refresh_token_xxx
 pip install -r requirements.txt
 ```
 
-### 2. 设置后台密码
+### 2. 设置后台密码（可选，默认无登录）
 
-项目通过环境变量 `ADMIN_PASSWORD` 控制后台登录密码。
+系统默认开启本地直接访问模式（无登录密码），方便本机或受信任内网使用。
+如需启用密码登录，请在启动前自行扩展 `icutool_mail.py` 的中间件逻辑。
 
-Windows PowerShell：
-
-```powershell
-$env:ADMIN_PASSWORD="your_password"
-```
-
-Linux Shell：
-
-```shell
-export ADMIN_PASSWORD="your_password"
-```
-
-如果未设置，默认密码为：
-
-```text
-admin123
-```
+历史上曾通过环境变量 `ADMIN_PASSWORD` 控制后台密码，当前版本已移除该机制，
+访问根路径 `/` 即可直接进入后台。
 
 ### 3. 启动项目
 
@@ -234,8 +229,8 @@ http://IP:10019
 
 当前项目定位为本地管理工具或受信任环境下的内部工具，登录机制较轻量：
 
-- 使用单一后台密码登录
-- 后续接口通过 `X-Token` 校验
+- 默认无登录密码，访问根路径即可进入后台
+- 外部应用接入通过 `X-Api-Key` 请求头校验
 - 不依赖 JWT、Session、Redis
 
 因此更适合：
@@ -246,7 +241,7 @@ http://IP:10019
 
 如果后续要面向公网部署，建议继续补强：
 
-- 更安全的认证机制
+- 更安全的认证机制（如反向代理 + Basic Auth / IP 白名单）
 - HTTPS
 - 更细粒度的权限控制
 - 敏感信息加密存储

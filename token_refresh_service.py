@@ -2,12 +2,14 @@ import json
 import logging
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from html import escape
 from pathlib import Path
 
 from database import SessionLocal
 from mail_service import MailServiceError, get_mail_body_render_mode, load_account_mails
+from mail_cache_service import save_mail_cache
 from models import MailAccount, TokenRefreshLog
 
 
@@ -21,6 +23,10 @@ logger.propagate = False
 
 REFRESH_HOUR = 3
 ALLOWED_PAGE_SIZES = {10, 30, 50}
+# 并发刷新线程数（太多会被微软限流，5-10 比较合理）
+MAX_WORKERS = 5
+# 单账号超时（秒），超过就跳过
+SINGLE_ACCOUNT_TIMEOUT = 30
 
 _refresh_job_lock = threading.Lock()
 _scheduler_stop_event = threading.Event()
@@ -324,78 +330,137 @@ def _acquire_refresh_job_lock() -> None:
         raise TokenRefreshTaskRunningError("Token refresh task is already running, please try again later.")
 
 
+def _refresh_single_account(account_id: int) -> dict:
+    """
+    刷新单个账号：刷新 token + 拉取最新邮件。
+    使用独立数据库 Session（线程安全）。
+    """
+    result = {
+        "status": "failed",
+        "email": "",
+        "subject": "",
+        "mail_from": "",
+        "mail_to": "",
+        "mail_dt": "",
+        "body": "",
+        "error": "",
+    }
+
+    with SessionLocal() as db:
+        account = db.query(MailAccount).filter(MailAccount.id == account_id).first()
+        if not account:
+            result["error"] = "account not found"
+            return result
+
+        result["email"] = account.email
+
+        try:
+            items = load_account_mails(account, db, folder="inbox", limit=1)
+            account.valid_status = 1
+            db.commit()
+
+            # 写入邮件缓存（供前端秒出）
+            if items:
+                save_mail_cache(db, account_id, "inbox", items)
+
+            latest_mail = items[0] if items else None
+            if latest_mail:
+                result["status"] = "success"
+                result["subject"] = latest_mail.get("subject") or ""
+                result["mail_from"] = latest_mail.get("mail_from") or ""
+                result["mail_to"] = latest_mail.get("mail_to") or ""
+                result["mail_dt"] = latest_mail.get("mail_dt") or ""
+                result["body"] = latest_mail.get("body") or ""
+            else:
+                result["status"] = "empty"
+        except MailServiceError as exc:
+            account.valid_status = 0
+            db.commit()
+            result["error"] = exc.message
+        except Exception as exc:
+            account.valid_status = 0
+            db.commit()
+            result["error"] = str(exc)[:200]
+
+    return result
+
+
 def _run_token_refresh_job_with_lock(trigger_type: str = "manual") -> TokenRefreshLog:
     trigger_label = "scheduled task" if trigger_type == "scheduled" else "manual trigger"
     logger.info("Starting token refresh job, trigger type: %s", trigger_label)
 
     with SessionLocal() as db:
-        # The refresh job should always scan the full mailbox list without
-        # filtering by valid_status, then update that status from the result.
         accounts = db.query(MailAccount).order_by(MailAccount.id.asc()).all()
+        account_ids = [a.id for a in accounts]
+        total_count = len(account_ids)
+
+        if not total_count:
+            logger.info("No accounts to refresh")
+            log = TokenRefreshLog(
+                trigger_type=trigger_type,
+                total_count=0,
+                success_count=0,
+                failed_count=0,
+                failure_details="[]",
+                html_content="",
+                started_at=int(time.time()),
+                finished_at=int(time.time()),
+                duration_seconds=0,
+                created_at=int(time.time()),
+            )
+            db.add(log)
+            db.commit()
+            db.refresh(log)
+            return log
+
         started_at = int(time.time())
         failures = []
         success_count = 0
-        total_count = len(accounts)
         account_results = []
 
-        for index, account in enumerate(accounts, start=1):
-            logger.info("Refreshing account %d/%d: %s", index, total_count, account.email)
-            try:
-                items = load_account_mails(account, db, folder="inbox", limit=1)
-                account.valid_status = 1
-                db.commit()
-                success_count += 1
+        # 并发刷新
+        max_workers = min(MAX_WORKERS, total_count)
+        logger.info("Refreshing %d accounts with %d workers", total_count, max_workers)
 
-                latest_mail = items[0] if items else None
-                if latest_mail:
-                    account_results.append(
-                        {
-                            "status": "success",
-                            "email": account.email,
-                            "subject": latest_mail.get("subject") or "",
-                            "mail_from": latest_mail.get("mail_from") or "",
-                            "mail_to": latest_mail.get("mail_to") or "",
-                            "mail_dt": latest_mail.get("mail_dt") or "",
-                            "body": latest_mail.get("body") or "",
-                        }
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_id = {
+                executor.submit(_refresh_single_account, aid): aid
+                for aid in account_ids
+            }
+
+            completed = 0
+            for future in as_completed(future_to_id, timeout=total_count * SINGLE_ACCOUNT_TIMEOUT):
+                completed += 1
+                account_id = future_to_id[future]
+
+                try:
+                    result = future.result(timeout=SINGLE_ACCOUNT_TIMEOUT)
+                except Exception as exc:
+                    result = {
+                        "status": "failed",
+                        "email": "",
+                        "error": f"thread error: {str(exc)[:150]}",
+                    }
+
+                account_results.append(result)
+
+                if result["status"] == "success" or result["status"] == "empty":
+                    success_count += 1
+                    logger.info(
+                        "Refreshed %d/%d: %s ✓",
+                        completed, total_count, result.get("email", "?"),
                     )
                 else:
-                    account_results.append(
-                        {
-                            "status": "empty",
-                            "email": account.email,
-                            "subject": "",
-                            "mail_from": "",
-                            "mail_to": "",
-                            "mail_dt": "",
-                            "body": "",
-                        }
+                    failures.append({
+                        "email": result.get("email", "?"),
+                        "error": result.get("error", "unknown"),
+                    })
+                    logger.error(
+                        "Refresh failed %d/%d: %s ✗ %s",
+                        completed, total_count,
+                        result.get("email", "?"),
+                        result.get("error", ""),
                     )
-
-                logger.info("Refresh succeeded for account %d/%d: %s", index, total_count, account.email)
-            except MailServiceError as exc:
-                account.valid_status = 0
-                db.commit()
-                failures.append(
-                    {
-                        "email": account.email,
-                        "error": exc.message,
-                    }
-                )
-                account_results.append(
-                    {
-                        "status": "failed",
-                        "email": account.email,
-                        "error": exc.message,
-                    }
-                )
-                logger.error(
-                    "Refresh failed for account %d/%d: %s, error: %s",
-                    index,
-                    total_count,
-                    account.email,
-                    exc.message,
-                )
 
         finished_at = int(time.time())
         export_html = _build_latest_mail_export_html(

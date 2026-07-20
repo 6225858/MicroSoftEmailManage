@@ -2,3 +2,19 @@
 mail.db
 __pycache__
 .env*
+
+# 日志 / 临时文件
+*.log
+_server*.log
+_runserver.py
+_test_accounts.txt
+_maillist*.png
+
+# 运行时生成的配置(含用户 GitHub 仓库地址等本地设置)
+settings.json
+
+# 数据目录
+data/
+
+# 旧版 HTML(已迁移到 templates/)
+html/

@@ -4,7 +4,10 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>邮箱管理后台</title>
-    <link rel="stylesheet" href="/static/app.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/app.css?v=15">
 </head>
 <body>
     <div class="page-shell app-shell">
@@ -19,11 +22,13 @@
                 <button class="menu-item is-active" type="button" data-view="accounts">账号管理</button>
                 <button class="menu-item" type="button" data-view="mails">邮件查看</button>
                 <button class="menu-item" type="button" data-view="logs">日志</button>
+                <button class="menu-item" type="button" data-view="api">API管理</button>
+                <button class="menu-item" type="button" data-view="proxy">代理池</button>
+                <button class="menu-item" type="button" data-view="settings">设置</button>
             </nav>
 
             <div class="sidebar-footer">
                 <span id="account-count" class="pill">0 个账号</span>
-                <button id="logout-btn" class="button button-ghost" type="button">退出登录</button>
             </div>
         </aside>
 
@@ -42,18 +47,42 @@
 
             <section class="view-panel is-visible" data-panel="accounts">
                 <div class="content-grid content-grid-accounts">
-                    <section class="panel">
+                    <section class="panel" id="import-panel">
                         <div class="panel-head">
                             <div>
                                 <h3>批量导入邮箱</h3>
-                                <p class="muted">每行一个账号，格式：邮箱----密码----clientid----refresh_token</p>
+                                <p class="muted">每行一个账号，默认格式：邮箱----密码----client_id----refresh_token；IMAP/POP3 账号只需 邮箱----密码。支持拖拽 .txt/.csv 文件到此处自动导入</p>
                             </div>
                         </div>
 
                         <div class="stack gap-sm">
-                            <textarea id="import-input" class="textarea textarea-lg" placeholder="示例：&#10;abc@hotmail.com----123456----clientidxxxx----refresh_token_xxx"></textarea>
+                            <div class="import-protocol-row">
+                                <label class="field-label" for="import-protocol-select">取件协议</label>
+                                <select id="import-protocol-select" class="input filter-select">
+                                    <option value="auto" selected>自动选择（推荐，按 Graph → IMAP → POP3 顺序尝试）</option>
+                                    <option value="graph">仅 Graph API（需 refresh_token）</option>
+                                    <option value="imap">仅 IMAP（用邮箱密码）</option>
+                                    <option value="pop3">仅 POP3（用邮箱密码）</option>
+                                </select>
+                            </div>
+                            <div id="import-server-row" class="import-protocol-row" hidden>
+                                <label class="field-label" for="import-server-input">邮件服务器（可选）</label>
+                                <input id="import-server-input" class="input" type="text" placeholder="例如：outlook.office365.com:993（留空使用默认）">
+                            </div>
+                            <div id="import-ssl-row" class="import-protocol-row" hidden>
+                                <label class="field-label" for="import-ssl-select">SSL</label>
+                                <select id="import-ssl-select" class="input filter-select">
+                                    <option value="1" selected>启用 SSL/TLS</option>
+                                    <option value="0">不启用</option>
+                                </select>
+                            </div>
+                            <textarea id="import-input" class="textarea textarea-lg" placeholder="示例（Graph）：&#10;abc@hotmail.com----123456----clientidxxxx----refresh_token_xxx&#10;&#10;示例（IMAP/POP3）：&#10;abc@hotmail.com----123456&#10;abc2@hotmail.com----654321"></textarea>
                             <div class="action-row">
                                 <button id="import-btn" class="button" type="button">开始导入</button>
+                                <label class="button button-ghost" for="import-file-input" style="cursor:pointer; display:inline-flex; align-items:center;">
+                                    从 TXT 文件导入
+                                </label>
+                                <input id="import-file-input" type="file" accept=".txt,.csv" hidden>
                             </div>
                             <p id="import-message" class="message"></p>
                         </div>
@@ -68,6 +97,17 @@
                         </div>
 
                         <div class="stack gap-sm">
+                            <div class="bulk-select-row" data-bulk-target="accounts">
+                                <label class="bulk-checkbox">
+                                    <input type="checkbox" id="accounts-bulk-select-all">
+                                    <span>全选</span>
+                                </label>
+                                <span class="bulk-summary">已选 <strong class="bulk-selected-count">0</strong> / <span class="bulk-total-count">0</span></span>
+                                <div class="bulk-action-buttons">
+                                    <button class="button button-ghost bulk-refresh-btn" type="button" id="accounts-bulk-refresh-btn" disabled>刷新选中</button>
+                                    <button class="button button-danger bulk-delete-btn" type="button" id="accounts-bulk-delete-btn" disabled>删除选中</button>
+                                </div>
+                            </div>
                             <div class="filter-row">
                                 <input id="search-input" class="input" type="text" placeholder="搜索邮箱">
                                 <select id="tag-filter" class="input filter-select">
@@ -116,6 +156,11 @@
                                 </div>
                                 <p id="account-message" class="message"></p>
                             </div>
+
+                            <div class="danger-zone">
+                                <span class="field-label">危险操作</span>
+                                <button id="delete-account-btn" class="button button-danger" type="button" disabled>删除此账号</button>
+                            </div>
                         </div>
                     </section>
                 </div>
@@ -138,6 +183,17 @@
                         </div>
 
                         <div class="stack gap-sm">
+                            <div class="bulk-select-row" data-bulk-target="mails">
+                                <label class="bulk-checkbox">
+                                    <input type="checkbox" id="mails-bulk-select-all">
+                                    <span>全选</span>
+                                </label>
+                                <span class="bulk-summary">已选 <strong class="bulk-selected-count">0</strong> / <span class="bulk-total-count">0</span></span>
+                                <div class="bulk-action-buttons">
+                                    <button class="button button-ghost bulk-refresh-btn" type="button" id="mails-bulk-refresh-btn" disabled>刷新选中</button>
+                                    <button class="button button-danger bulk-delete-btn" type="button" id="mails-bulk-delete-btn" disabled>删除选中</button>
+                                </div>
+                            </div>
                             <div class="filter-row">
                                 <input id="mail-search-input" class="input" type="text" placeholder="搜索邮箱">
                                 <select id="mail-tag-filter" class="input filter-select">
@@ -164,6 +220,7 @@
                                     <button class="tab" data-folder="junk" type="button">垃圾箱</button>
                                 </div>
                                 <button id="copy-mail-address-btn" class="button button-ghost" type="button">复制邮箱地址</button>
+                                <button id="force-refresh-mails-btn" class="button button-ghost" type="button" disabled>立即刷新</button>
                             </div>
                         </div>
 
@@ -219,6 +276,221 @@
 
                         <p id="refresh-log-message" class="message"></p>
                         <div id="refresh-log-list" class="refresh-log-list"></div>
+                    </section>
+                </div>
+            </section>
+
+            <section class="view-panel" data-panel="api">
+                <div class="content-grid content-grid-api">
+                    <section class="panel">
+                        <div class="panel-head">
+                            <div>
+                                <h3>API Key 管理</h3>
+                                <p class="muted">创建 API Key 后，其他应用可通过 <code>X-Api-Key</code> 请求头接入本系统</p>
+                            </div>
+                        </div>
+
+                        <div class="stack gap-sm">
+                            <div class="api-create-row">
+                                <input id="api-key-name-input" class="input" type="text" placeholder="输入 Key 名称，例如：监控脚本、自动化工具">
+                                <button id="api-key-create-btn" class="button" type="button">创建 API Key</button>
+                            </div>
+                            <p id="api-message" class="message"></p>
+                            <div id="api-key-list" class="api-key-list">
+                                <div class="empty-state">暂无 API Key，点击上方按钮创建一个</div>
+                            </div>
+                        </div>
+                    </section>
+
+                    <section class="panel">
+                        <div class="panel-head">
+                            <div>
+                                <h3>接口文档</h3>
+                                <p class="muted">接入方式：在请求头中设置 <code>X-Api-Key: 你的Key</code></p>
+                            </div>
+                        </div>
+
+                        <div class="stack gap-sm">
+                            <div class="api-base-url-box">
+                                <span class="field-label">服务地址</span>
+                                <div class="api-base-url-row">
+                                    <code id="api-base-url" class="api-base-url-value">http://localhost:10019</code>
+                                    <button id="api-base-url-copy-btn" class="api-key-copy-btn" type="button">复制</button>
+                                </div>
+                            </div>
+
+                            <div class="api-doc-list">
+                                <div class="api-doc-item">
+                                    <span class="api-method get">GET</span>
+                                    <code class="api-doc-path" data-path="/api/accounts">/api/accounts</code>
+                                    <span class="muted">获取所有邮箱账号</span>
+                                </div>
+                                <div class="api-doc-item">
+                                    <span class="api-method get">GET</span>
+                                    <code class="api-doc-path" data-path="/api/accounts?q=关键词&tag=标签">/api/accounts?q=关键词&tag=标签</code>
+                                    <span class="muted">搜索/筛选邮箱</span>
+                                </div>
+                                <div class="api-doc-item">
+                                    <span class="api-method get">GET</span>
+                                    <code class="api-doc-path" data-path="/api/accounts/{id}/mails?folder=inbox">/api/accounts/{id}/mails?folder=inbox</code>
+                                    <span class="muted">获取指定邮箱的邮件</span>
+                                </div>
+                                <div class="api-doc-item">
+                                    <span class="api-method get">GET</span>
+                                    <code class="api-doc-path" data-path="/api/accounts/{id}/folders">/api/accounts/{id}/folders</code>
+                                    <span class="muted">获取邮箱文件夹列表</span>
+                                </div>
+                                <div class="api-doc-item">
+                                    <span class="api-method get">GET</span>
+                                    <code class="api-doc-path" data-path="/api/accounts/{id}/mails/{mail_id}">/api/accounts/{id}/mails/{mail_id}</code>
+                                    <span class="muted">获取单封邮件详情</span>
+                                </div>
+                                <div class="api-doc-item">
+                                    <span class="api-method post">POST</span>
+                                    <code class="api-doc-path" data-path="/api/token-refresh-logs/trigger">/api/token-refresh-logs/trigger</code>
+                                    <span class="muted">触发全量令牌刷新</span>
+                                </div>
+                                <div class="api-doc-item">
+                                    <span class="api-method get">GET</span>
+                                    <code class="api-doc-path" data-path="/api/token-refresh-logs">/api/token-refresh-logs</code>
+                                    <span class="muted">查看刷新日志</span>
+                                </div>
+                                <div class="api-doc-item">
+                                    <span class="api-method get">GET</span>
+                                    <code class="api-doc-path" data-path="/api/accounts/export">/api/accounts/export</code>
+                                    <span class="muted">导出邮箱账号数据</span>
+                                </div>
+                                <div class="api-doc-item">
+                                    <span class="api-method get">GET</span>
+                                    <code class="api-doc-path" data-path="/api/mails/by-tag?tag=标签&limit=5">/api/mails/by-tag?tag=标签&limit=5</code>
+                                    <span class="muted">按标签批量获取所有账号最新邮件</span>
+                                </div>
+                            </div>
+                        </div>
+                    </section>
+                </div>
+            </section>
+
+            <section class="view-panel" data-panel="proxy">
+                <div class="content-grid content-grid-proxy">
+                    <section class="panel">
+                        <div class="panel-head">
+                            <div>
+                                <h3>代理列表</h3>
+                                <p class="muted">已配置 <span id="proxy-count">0</span> 个代理（可用 <span id="proxy-available-count">0</span>）</p>
+                            </div>
+                        </div>
+
+                        <div class="proxy-toolbar">
+                            <button id="proxy-add-btn" class="button" type="button">手动添加</button>
+                            <button id="proxy-check-btn" class="button button-ghost" type="button">检测全部</button>
+                        </div>
+                        <p id="proxy-message" class="message"></p>
+                        <div id="proxy-list" class="proxy-list">
+                            <div class="empty-state">暂无代理，请先添加</div>
+                        </div>
+                    </section>
+
+                    <section class="panel">
+                        <div class="panel-head">
+                            <div>
+                                <h3>手动添加 / 批量导入</h3>
+                                <p class="muted">支持: <code>ip:port:user:pass</code>、<code>ip:port</code>、<code>http://user:pass@ip:port</code>、<code>socks5://ip:port</code></p>
+                            </div>
+                        </div>
+
+                        <div class="stack gap-sm">
+                            <!-- 手动添加表单 -->
+                            <div id="proxy-add-form" class="proxy-add-form" hidden>
+                                <div class="proxy-add-row">
+                                    <select id="proxy-add-type" class="input" style="width:100px">
+                                        <option value="http">HTTP</option>
+                                        <option value="socks5">SOCKS5</option>
+                                    </select>
+                                    <input id="proxy-add-host" class="input" type="text" placeholder="地址 (IP或域名)" style="flex:2">
+                                    <input id="proxy-add-port" class="input" type="number" placeholder="端口" value="1080" style="width:90px">
+                                </div>
+                                <div class="proxy-add-row">
+                                    <input id="proxy-add-user" class="input" type="text" placeholder="用户名 (可选)">
+                                    <input id="proxy-add-pass" class="input" type="text" placeholder="密码 (可选)">
+                                </div>
+                                <div class="action-row">
+                                    <button id="proxy-add-save-btn" class="button" type="button">添加代理</button>
+                                    <button id="proxy-add-cancel-btn" class="button button-ghost" type="button">取消</button>
+                                </div>
+                            </div>
+
+                            <textarea id="proxy-import-input" class="textarea textarea-lg" placeholder="每行一个代理&#10;例如：&#10;192.168.1.100:8080:user:pass&#10;10.0.0.1:8080&#10;http://user:pass@10.0.0.2:3128&#10;socks5://10.0.0.3:1080"></textarea>
+                            <div class="action-row">
+                                <button id="proxy-import-btn" class="button" type="button">批量导入</button>
+                            </div>
+                            <p id="proxy-import-message" class="message"></p>
+                        </div>
+                    </section>
+                </div>
+            </section>
+
+            <section class="view-panel" data-panel="settings">
+                <div class="content-grid content-grid-settings">
+                    <section class="panel">
+                        <div class="panel-head">
+                            <div>
+                                <h3>应用信息</h3>
+                                <p class="muted">当前版本与 GitHub 仓库配置</p>
+                            </div>
+                        </div>
+                        <div class="stack gap-md">
+                            <div class="info-card">
+                                <span class="info-label">当前版本</span>
+                                <strong id="settings-current-version" class="version-display">—</strong>
+                            </div>
+
+                            <div class="stack gap-sm">
+                                <label class="field-label" for="settings-github-repo-input">GitHub 仓库地址</label>
+                                <input id="settings-github-repo-input" class="input" type="text" placeholder="owner/repo（如 myname/MicroSoftEmailManage）">
+                                <p class="muted hint-text">填写你的 GitHub 用户名和仓库名，用于检查 Release 更新</p>
+                                <div class="action-row">
+                                    <button id="settings-save-repo-btn" class="button" type="button">保存仓库地址</button>
+                                </div>
+                                <p id="settings-repo-message" class="message"></p>
+                            </div>
+                        </div>
+                    </section>
+
+                    <section class="panel">
+                        <div class="panel-head">
+                            <div>
+                                <h3>检查更新</h3>
+                                <p class="muted">检测 GitHub Release 是否有新版本</p>
+                            </div>
+                        </div>
+                        <div class="stack gap-md">
+                            <div class="action-row">
+                                <button id="settings-check-update-btn" class="button" type="button">立即检查更新</button>
+                                <span id="settings-check-status" class="muted hint-text"></span>
+                            </div>
+
+                            <div id="settings-update-result" class="update-result" hidden>
+                                <div class="info-card">
+                                    <span class="info-label">最新版本</span>
+                                    <strong id="settings-latest-version" class="version-display">—</strong>
+                                    <span id="settings-update-badge" class="update-badge" hidden>有新版本</span>
+                                </div>
+                                <div class="info-card">
+                                    <span class="info-label">发布时间</span>
+                                    <strong id="settings-published-at" class="version-display">—</strong>
+                                </div>
+                                <div id="settings-release-notes-card" class="stack gap-sm" hidden>
+                                    <label class="field-label">更新日志</label>
+                                    <div id="settings-release-notes" class="release-notes"></div>
+                                </div>
+                                <div class="action-row">
+                                    <a id="settings-release-link" class="button" href="#" target="_blank" rel="noopener noreferrer" hidden>前往 GitHub 下载</a>
+                                </div>
+                            </div>
+
+                            <p id="settings-update-message" class="message"></p>
+                        </div>
                     </section>
                 </div>
             </section>
@@ -315,6 +587,33 @@
         </section>
     </div>
 
-    <script src="/static/app.js"></script>
+    <div id="delete-confirm-modal" class="modal-shell" hidden>
+        <div id="delete-confirm-backdrop" class="modal-backdrop"></div>
+        <section class="modal-card" role="dialog" aria-modal="true" aria-labelledby="delete-confirm-title">
+            <div class="modal-head">
+                <div>
+                    <p class="eyebrow">Confirm Delete</p>
+                    <h3 id="delete-confirm-title">删除邮箱账号</h3>
+                    <p class="muted">此操作不可恢复，将同时删除该账号的邮件缓存，请谨慎操作</p>
+                </div>
+                <button id="delete-confirm-close-btn" class="icon-button" type="button" aria-label="关闭删除确认弹窗">×</button>
+            </div>
+
+            <div class="modal-account-card">
+                <span class="info-label">待删除账号</span>
+                <strong id="delete-confirm-count" class="tag-modal-email">0 个</strong>
+                <div id="delete-confirm-list" class="delete-confirm-list"></div>
+            </div>
+
+            <p id="delete-confirm-message" class="message modal-message"></p>
+
+            <div class="modal-actions">
+                <button id="delete-confirm-cancel-btn" class="button button-ghost" type="button">取消</button>
+                <button id="delete-confirm-save-btn" class="button button-danger" type="button">确认删除</button>
+            </div>
+        </section>
+    </div>
+
+    <script src="/static/app.js?v=13"></script>
 </body>
 </html>

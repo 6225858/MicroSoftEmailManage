@@ -1,23 +1,22 @@
-# 使用国内镜像加速前缀拉取基础镜像，避免 Docker Hub 在国内被墙
-ARG REGISTRY=docker.m.daocloud.io
-FROM ${REGISTRY}/library/python:3.11-slim
+FROM docker.io/library/python:3.11-slim
 
 WORKDIR /app
 
-# Install system dependencies (needed for some Python packages)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc \
-    && rm -rf /var/lib/apt/lists/*
-
-# Install Python dependencies
+# 安装 Python 依赖（你的依赖都是纯 Python，不需要 gcc）
 COPY requirements.txt .
-RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements.txt
+RUN pip install --no-cache-dir \
+    -i https://mirrors.aliyun.com/pypi/simple/ \
+    --trusted-host mirrors.aliyun.com \
+    -r requirements.txt
 
-# Copy application code
+# 复制应用代码
 COPY . .
 
-# Expose port
-EXPOSE 10019
+# 创建数据目录
+RUN mkdir -p /app/data /app/html
 
-# Run the application
-CMD ["uvicorn", "icutool_mail", "app", "--host", "0.0.0.0", "--port", "10019", "--workers", "2"]
+EXPOSE 10019
+ENV PYTHONUNBUFFERED=1
+
+# 启动应用
+CMD ["uvicorn", "icutool_mail:app", "--host", "0.0.0.0", "--port", "10019"]

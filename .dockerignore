@@ -1,11 +1,29 @@
+# Git
+.git
+.gitignore
+.gitattributes
+
+# Python
 __pycache__
 *.pyc
 *.pyo
-.git
-.gitignore
-img/
+*.egg-info
+
+# 数据文件（通过卷挂载，不打包进镜像）
+data/
 html/
-*.db
-.env
+mail.db
+
+# IDE
 .vscode
 .idea
+
+# 文档
+img/
+*.md
+hotmail_mail_manager_architecture_plan.md
+
+# Docker
+Dockerfile
+.dockerignore
+docker-compose.yml
