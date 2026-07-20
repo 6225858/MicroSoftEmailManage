@@ -3153,19 +3153,16 @@ function handleUpdateProgressEvent(data) {
     }
 
     if (stage === "done") {
-        // 更新完成
-        if (elements.updateProgressTitle) elements.updateProgressTitle.textContent = "更新完成";
-        if (elements.updateProgressSubtitle) elements.updateProgressSubtitle.textContent = "请重启服务使更新生效";
-        if (elements.updateProgressCloseBtn) elements.updateProgressCloseBtn.hidden = false;
-        if (elements.updateProgressCancelBtn) {
-            elements.updateProgressCancelBtn.textContent = "关闭";
-            elements.updateProgressCancelBtn.disabled = false;
+        // 更新完成(done 之后会紧跟 restarting 事件)
+        if (elements.updateProgressStage) {
+            elements.updateProgressStage.textContent = message || "更新完成，正在准备重启服务…";
         }
-        if (elements.updateSuccessBox) elements.updateSuccessBox.hidden = false;
-        if (elements.updateSuccessMessage && data.suggestion) {
-            elements.updateSuccessMessage.textContent = data.suggestion;
+        if (elements.updateVersionInfo && data.latest_version && data.current_version) {
+            elements.updateVersionInfo.hidden = false;
+            if (elements.updateVersionChange) {
+                elements.updateVersionChange.textContent = `${data.current_version} → ${data.latest_version}`;
+            }
         }
-        // 跳过的文件
         if (data.skipped_files && data.skipped_files.length > 0) {
             if (elements.updateSkippedFiles) elements.updateSkippedFiles.hidden = false;
             if (elements.updateSkippedFilesList) {
@@ -3174,8 +3171,29 @@ function handleUpdateProgressEvent(data) {
                     .join("");
             }
         }
-        // 隐藏一键更新按钮
         if (elements.settingsPerformUpdateBtn) elements.settingsPerformUpdateBtn.hidden = true;
+    } else if (stage === "restarting") {
+        // 服务正在重启
+        if (elements.updateProgressTitle) elements.updateProgressTitle.textContent = "正在重启服务";
+        if (elements.updateProgressSubtitle) elements.updateProgressSubtitle.textContent = "服务将短暂不可用，页面会自动刷新";
+        if (elements.updateProgressStage) {
+            elements.updateProgressStage.innerHTML = '<span class="restart-spinner"></span> 服务正在重启，请等待页面自动刷新…';
+        }
+        if (elements.updateProgressFill) {
+            elements.updateProgressFill.style.width = "100%";
+        }
+        if (elements.updateProgressPercent) {
+            elements.updateProgressPercent.textContent = "⟳";
+        }
+        // 隐藏成功/错误区域,禁用关闭按钮(重启中不能关闭)
+        if (elements.updateSuccessBox) elements.updateSuccessBox.hidden = true;
+        if (elements.updateErrorBox) elements.updateErrorBox.hidden = true;
+        if (elements.updateProgressCancelBtn) {
+            elements.updateProgressCancelBtn.disabled = true;
+            elements.updateProgressCancelBtn.textContent = "等待重启…";
+        }
+        // 开始轮询 /health,服务恢复后自动刷新
+        pollForRestart();
     } else if (stage === "error") {
         // 更新失败
         showUpdateError(data.error_type || "未知错误", message, data.suggestion || "");
@@ -3203,6 +3221,73 @@ function showUpdateError(errorType, message, suggestion) {
         elements.updateErrorSuggestion.innerHTML = suggestion
             ? `<span class="suggestion-label">建议操作</span><div class="suggestion-text">${escapeHtml(suggestion).replace(/\n/g, "<br>")}</div>`
             : "";
+    }
+}
+
+// ─── 轮询服务重启 ─────────────────────────────────────
+// 服务重启后 /health 会先不可用(连接失败)再恢复,恢复后自动刷新页面
+async function pollForRestart() {
+    const maxAttempts = 60;  // 最多等 120 秒
+    const interval = 2000;    // 每 2 秒轮询一次
+    let connectedBefore = false;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, interval));
+        try {
+            const response = await fetch("/health", { method: "GET", cache: "no-store" });
+            if (response.ok) {
+                if (connectedBefore) {
+                    // 第一次连接成功可能是旧进程还没退出,需要确认是"先断开再恢复"
+                    // 但如果连续两次都成功,说明新进程已启动
+                }
+                // 先假设已恢复,但需要确认旧进程确实退出过
+                // 简单策略:第一次成功后等 2 秒再确认一次
+                if (!connectedBefore) {
+                    connectedBefore = true;
+                    // 等一下再确认
+                    await new Promise((resolve) => setTimeout(resolve, 2000));
+                    try {
+                        const confirmResp = await fetch("/health", { method: "GET", cache: "no-store" });
+                        if (confirmResp.ok) {
+                            // 确认恢复,刷新页面
+                            if (elements.updateProgressStage) {
+                                elements.updateProgressStage.innerHTML = '<span class="restart-success">✓ 服务已重启，正在刷新页面…</span>';
+                            }
+                            if (elements.updateProgressCancelBtn) {
+                                elements.updateProgressCancelBtn.disabled = false;
+                                elements.updateProgressCancelBtn.textContent = "刷新页面";
+                                elements.updateProgressCancelBtn.onclick = () => window.location.reload();
+                            }
+                            setTimeout(() => window.location.reload(), 1500);
+                            return;
+                        }
+                    } catch (e) {
+                        // 确认失败,继续等待
+                        connectedBefore = false;
+                    }
+                }
+            }
+        } catch (e) {
+            // 服务不可用(正在重启中),这是正常的
+            connectedBefore = false;
+            if (elements.updateProgressStage) {
+                elements.updateProgressStage.innerHTML =
+                    `<span class="restart-spinner"></span> 服务正在重启…（已等待 ${attempt * 2} 秒）`;
+            }
+        }
+    }
+
+    // 超时
+    if (elements.updateProgressTitle) elements.updateProgressTitle.textContent = "重启超时";
+    if (elements.updateProgressSubtitle) elements.updateProgressSubtitle.textContent = "服务可能未能自动重启";
+    if (elements.updateProgressStage) {
+        elements.updateProgressStage.innerHTML =
+            '<span class="restart-warning">服务重启超时，请手动重启服务后刷新页面</span>';
+    }
+    if (elements.updateProgressCancelBtn) {
+        elements.updateProgressCancelBtn.disabled = false;
+        elements.updateProgressCancelBtn.textContent = "关闭";
+        elements.updateProgressCancelBtn.onclick = null;
     }
 }
 

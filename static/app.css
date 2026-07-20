@@ -1354,6 +1354,33 @@ time,
     color: var(--accent);
 }
 
+/* 重启中旋转动画 */
+.restart-spinner {
+    display: inline-block;
+    width: 16px;
+    height: 16px;
+    border: 2px solid var(--border);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+    vertical-align: middle;
+    margin-right: 8px;
+}
+
+@keyframes spin {
+    to { transform: rotate(360deg); }
+}
+
+.restart-success {
+    color: #10b981;
+    font-weight: 600;
+}
+
+.restart-warning {
+    color: #f59e0b;
+    font-weight: 600;
+}
+
 @keyframes pulse-glow {
     0%, 100% { box-shadow: 0 2px 8px rgba(16, 185, 129, 0.3); }
     50% { box-shadow: 0 2px 16px rgba(16, 185, 129, 0.5); }

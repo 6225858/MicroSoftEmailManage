@@ -1438,12 +1438,77 @@ def perform_update():
                     if d == "__pycache__":
                         shutil.rmtree(os.path.join(root, d), ignore_errors=True)
 
-            yield _emit("done", "更新完成", 100,
+            yield _emit("done", "更新完成，正在准备重启服务…", 100,
                         previous_version=APP_VERSION,
                         latest_version=latest_version,
                         release_url=release_url,
                         skipped_files=skipped_files,
                         suggestion="请重启服务使更新生效（关闭当前命令行窗口，重新执行 python icutool_mail.py）")
+
+            # ── 自动重启 ──
+            # 启动守护线程:等待响应发送完毕 → 启动重启脚本 → 退出当前进程
+            import sys
+            import threading
+            import platform
+
+            python_exe = sys.executable
+            is_windows = platform.system() == "Windows"
+
+            def _delayed_restart():
+                # 等待 StreamingResponse 发送完毕
+                time.sleep(3)
+                try:
+                    if is_windows:
+                        bat_path = os.path.join(PROJECT_ROOT, "_restart.bat")
+                        bat_content = (
+                            "@echo off\r\n"
+                            "timeout /t 3 /nobreak >nul\r\n"
+                            f'cd /d "{PROJECT_ROOT}"\r\n'
+                            f'"{python_exe}" icutool_mail.py\r\n'
+                            "del _restart.bat\r\n"
+                        )
+                        with open(bat_path, "w", encoding="utf-8") as f:
+                            f.write(bat_content)
+                        creation_flags = 0
+                        if hasattr(subprocess, "DETACHED_PROCESS"):
+                            creation_flags |= subprocess.DETACHED_PROCESS
+                        if hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
+                            creation_flags |= subprocess.CREATE_NEW_PROCESS_GROUP
+                        subprocess.Popen(
+                            ["cmd", "/c", bat_path],
+                            creationflags=creation_flags,
+                            close_fds=True,
+                            cwd=PROJECT_ROOT,
+                        )
+                    else:
+                        sh_path = os.path.join(PROJECT_ROOT, "_restart.sh")
+                        sh_content = (
+                            "#!/bin/bash\n"
+                            "sleep 3\n"
+                            f'cd "{PROJECT_ROOT}"\n'
+                            f'"{python_exe}" icutool_mail.py\n'
+                            "rm -f _restart.sh\n"
+                        )
+                        with open(sh_path, "w", encoding="utf-8") as f:
+                            f.write(sh_content)
+                        os.chmod(sh_path, 0o755)
+                        subprocess.Popen(
+                            ["bash", sh_path],
+                            start_new_session=True,
+                            close_fds=True,
+                            cwd=PROJECT_ROOT,
+                        )
+                    logger.info("已触发自动重启,3 秒后退出当前进程")
+                    time.sleep(1)
+                    os._exit(0)
+                except Exception as exc:
+                    logger.warning("自动重启失败: %s,请手动重启服务", exc)
+
+            yield _emit("restarting", "正在重启服务…（服务将短暂不可用，页面会自动刷新）", 100,
+                        previous_version=APP_VERSION,
+                        latest_version=latest_version)
+
+            threading.Thread(target=_delayed_restart, daemon=True).start()
 
         except Exception as exc:
             logger.warning("自动更新失败: %s", exc, exc_info=True)
