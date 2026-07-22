@@ -184,8 +184,24 @@ def release_claim(db: Session, claim_token: str) -> bool:
         db.commit()
         return False
     if claim.status == "completed":
+        db.commit()
         raise _claim_error("claim_completed", 409, "领取已完成")
 
-    db.delete(claim)
+    deleted = (
+        db.query(ChatgptEmailClaim)
+        .filter(
+            ChatgptEmailClaim.id == claim.id,
+            ChatgptEmailClaim.status == "active",
+        )
+        .delete(synchronize_session=False)
+    )
     db.commit()
-    return True
+    if deleted:
+        return True
+
+    claim = db.query(ChatgptEmailClaim).filter_by(claim_token=claim_token).one_or_none()
+    if claim is not None and claim.status == "completed":
+        db.commit()
+        raise _claim_error("claim_completed", 409, "领取已完成")
+    db.commit()
+    return False

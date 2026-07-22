@@ -3,7 +3,7 @@ import threading
 import unittest
 from pathlib import Path
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 
 from database import Base
@@ -79,6 +79,47 @@ class ClaimServiceTest(unittest.TestCase):
                 release_claim(db, "claim-d")
         self.assertEqual(caught.exception.code, "claim_completed")
         self.assertEqual(caught.exception.status_code, 409)
+
+    def test_release_cannot_delete_a_claim_completed_after_its_initial_read(self):
+        self.add_account("user@example.com")
+        with self.Session() as db:
+            claim_email(db, now=1000, token_factory=lambda: "claim-race")
+
+        completion_errors = []
+        delete_observed = []
+
+        def complete_in_parallel():
+            try:
+                with self.Session() as db:
+                    complete_claim(db, "claim-race", now=1001)
+            except Exception as exc:
+                completion_errors.append(exc)
+
+        def complete_before_delete(_conn, _cursor, statement, _parameters, _context, _executemany):
+            if not statement.lstrip().upper().startswith("DELETE FROM CHATGPT_EMAIL_CLAIM"):
+                return
+            if delete_observed:
+                return
+            delete_observed.append(True)
+            worker = threading.Thread(target=complete_in_parallel)
+            worker.start()
+            worker.join()
+
+        event.listen(self.engine, "before_cursor_execute", complete_before_delete)
+        try:
+            with self.Session() as db:
+                with self.assertRaises(AutomationError) as caught:
+                    release_claim(db, "claim-race")
+                remaining = db.query(ChatgptEmailClaim).filter_by(claim_token="claim-race").one()
+                account = db.query(MailAccount).filter_by(email="user@example.com").one()
+        finally:
+            event.remove(self.engine, "before_cursor_execute", complete_before_delete)
+
+        self.assertEqual(completion_errors, [])
+        self.assertEqual(delete_observed, [True])
+        self.assertEqual(caught.exception.code, "claim_completed")
+        self.assertEqual(remaining.status, "completed")
+        self.assertEqual(account.tags, "已注册chatgpt")
 
     def test_expired_fifteen_minute_lease_is_reclaimed(self):
         self.add_account("user@example.com")
