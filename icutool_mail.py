@@ -441,31 +441,41 @@ def get_chatgpt_verification_code(
         raise _automation_http_error(exc) from exc
 
     folders = ("inbox", "junk")
+    caches = {folder: get_mail_cache(db, account.id, folder) for folder in folders}
     tasks = {
         folder: refresh_mail_cache_async(account.id, folder, limit=10)
         for folder in folders
+        if not caches[folder] or not caches[folder].get("is_fresh", False)
     }
-    caches = {folder: get_mail_cache(db, account.id, folder) for folder in folders}
-    has_cached_items = any(cache and cache.get("items") for cache in caches.values())
-
-    if not has_cached_items:
-        deadline = time.monotonic() + 10
-        for task in tasks.values():
-            task.event.wait(timeout=max(0, deadline - time.monotonic()))
-        db.expire_all()
-        caches = {folder: get_mail_cache(db, account.id, folder) for folder in folders}
-        has_cached_items = any(cache and cache.get("items") for cache in caches.values())
-        if not has_cached_items and all(task.error for task in tasks.values()):
-            raise HTTPException(status_code=502, detail={
-                "code": "mail_fetch_failed",
-                "message": "Unable to refresh mailbox",
-            })
-
     match = find_latest_chatgpt_code(
         {folder: (cache or {}).get("items", []) for folder, cache in caches.items()},
         account.email,
         body.not_before,
     )
+
+    if match is None and tasks:
+        deadline = time.monotonic() + 10
+        for task in tasks.values():
+            task.event.wait(timeout=max(0, deadline - time.monotonic()))
+        db.expire_all()
+        caches = {folder: get_mail_cache(db, account.id, folder) for folder in folders}
+        match = find_latest_chatgpt_code(
+            {folder: (cache or {}).get("items", []) for folder, cache in caches.items()},
+            account.email,
+            body.not_before,
+        )
+        unavailable_folders = [
+            folder
+            for folder in folders
+            if not caches[folder]
+            and folder in tasks
+            and tasks[folder].error
+        ]
+        if match is None and len(unavailable_folders) == len(folders):
+            raise HTTPException(status_code=502, detail={
+                "code": "mail_fetch_failed",
+                "message": "Unable to refresh mailbox",
+            })
     try:
         renew_claim(db, claim, code_found=bool(match))
     except AutomationError as exc:

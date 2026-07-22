@@ -26,7 +26,7 @@ BODY_CODE_RE = re.compile(
 )
 EMAIL_RE = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.IGNORECASE)
 PROJECT_ACTUAL_ADDRESS_RE = re.compile(
-    rf"(?P<separator>^|,)\s*[^()]*\(\s*(?P<address>{EMAIL_RE.pattern})\s*\)\s*(?=,|$)",
+    rf"(?P<separator>^|,)\s*[^,]*?\(\s*(?P<address>{EMAIL_RE.pattern})\s*\)\s*(?=,|$)",
     re.IGNORECASE,
 )
 SHANGHAI_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")

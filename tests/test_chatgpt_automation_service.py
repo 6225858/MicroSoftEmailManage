@@ -354,3 +354,26 @@ class VerificationMatcherTest(unittest.TestCase):
                     {"inbox": [item]}, "user@outlook.com", self.not_before_ms
                 )
                 self.assertEqual(result is not None, should_match)
+
+    def test_accepts_final_parenthesized_address_after_display_name_parentheses(self):
+        item = matching_mail()
+        item["mail_from"] = "ChatGPT (Transactional) (noreply@tm.openai.com)"
+        item["mail_to"] = "Primary account (Registration) (user@outlook.com)"
+
+        result = find_latest_chatgpt_code(
+            {"inbox": [item]}, "user@outlook.com", self.not_before_ms
+        )
+
+        self.assertEqual(result["code"], "919020")
+
+    def test_rejects_invalid_timestamp_and_accepts_timezone_aware_timestamp(self):
+        invalid = matching_mail(received="not-a-timestamp")
+        self.assertIsNone(find_latest_chatgpt_code(
+            {"inbox": [invalid]}, "user@outlook.com", self.not_before_ms
+        ))
+
+        aware = matching_mail(received="2026-07-22T05:48:45+00:00")
+        result = find_latest_chatgpt_code(
+            {"inbox": [aware]}, "user@outlook.com", self.not_before_ms
+        )
+        self.assertEqual(result["code"], "919020")
