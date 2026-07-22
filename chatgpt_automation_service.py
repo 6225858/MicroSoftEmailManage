@@ -159,17 +159,23 @@ def renew_claim(
 
 def complete_claim(db: Session, claim_token: str, now: int | None = None) -> dict:
     completed_at = _now(now)
+    if db.in_transaction():
+        db.rollback()
+    db.execute(text("BEGIN IMMEDIATE"))
     claim = db.query(ChatgptEmailClaim).filter_by(claim_token=claim_token).one_or_none()
     if claim is None:
+        db.rollback()
         raise _claim_error("claim_not_found", 404, "领取不存在")
     if claim.status == "completed":
         db.commit()
         return {"ok": True, "status": "completed"}
     if claim.expires_at <= completed_at:
+        db.rollback()
         raise _claim_error("claim_expired", 410, "领取已过期")
 
     account = db.query(MailAccount).filter_by(id=claim.mail_account_id).one_or_none()
     if account is None:
+        db.rollback()
         raise _claim_error("claim_not_found", 404, "领取不存在")
     account.tags = append_exact_tag(account.tags, REGISTERED_TAG)
     claim.status = "completed"

@@ -121,6 +121,56 @@ class ClaimServiceTest(unittest.TestCase):
         self.assertEqual(remaining.status, "completed")
         self.assertEqual(account.tags, "已注册chatgpt")
 
+    def test_completion_serializes_with_release_before_tagging_account(self):
+        self.add_account("user@example.com")
+        with self.Session() as db:
+            claim_email(db, now=1000, token_factory=lambda: "claim-reverse-race")
+
+        release_finished = threading.Event()
+        release_errors = []
+        release_results = []
+        account_query_observed = []
+
+        def release_in_parallel():
+            try:
+                with self.Session() as db:
+                    release_results.append(release_claim(db, "claim-reverse-race"))
+            except Exception as exc:
+                release_errors.append(exc)
+            finally:
+                release_finished.set()
+
+        def attempt_release_before_completion_writes(
+            _conn, _cursor, statement, _parameters, _context, _executemany
+        ):
+            normalized = statement.lstrip().upper()
+            if "FROM MAIL_ACCOUNT" not in normalized or account_query_observed:
+                return
+            account_query_observed.append(True)
+            worker = threading.Thread(target=release_in_parallel)
+            worker.start()
+            release_finished.wait(timeout=0.2)
+
+        event.listen(self.engine, "before_cursor_execute", attempt_release_before_completion_writes)
+        try:
+            with self.Session() as db:
+                completed = complete_claim(db, "claim-reverse-race", now=1001)
+        finally:
+            event.remove(self.engine, "before_cursor_execute", attempt_release_before_completion_writes)
+
+        release_finished.wait(timeout=5)
+        with self.Session() as db:
+            claim = db.query(ChatgptEmailClaim).filter_by(claim_token="claim-reverse-race").one()
+            account = db.query(MailAccount).filter_by(email="user@example.com").one()
+
+        self.assertEqual(account_query_observed, [True])
+        self.assertEqual(completed, {"ok": True, "status": "completed"})
+        self.assertEqual(release_results, [])
+        self.assertEqual(len(release_errors), 1)
+        self.assertEqual(release_errors[0].code, "claim_completed")
+        self.assertEqual(claim.status, "completed")
+        self.assertEqual(account.tags, "已注册chatgpt")
+
     def test_expired_fifteen_minute_lease_is_reclaimed(self):
         self.add_account("user@example.com")
         with self.Session() as db:
