@@ -168,7 +168,7 @@ def refresh_mail_cache_async(
     返回 RefreshTask，调用方可 .event.wait(timeout=N) 等待完成。
     """
     from database import SessionLocal
-    from mail_service import load_account_mails, MailServiceError
+    from mail_service import load_account_mails, MailServiceError, safe_mail_error_tag
     from models import MailAccount
 
     key = (account_id, folder)
@@ -207,20 +207,20 @@ def refresh_mail_cache_async(
                         save_mail_cache(db, account_id, folder, items)
                         item_count = len(items)
                         logger.info(
-                            "后台刷新邮件缓存完成: %s/%s (%d封)",
-                            account.email, folder, item_count,
+                            "后台刷新邮件缓存完成: account=%d folder=%s (%d封)",
+                            account_id, folder, item_count,
                         )
         except MailServiceError as exc:
-            error_msg = exc.message
+            error_msg = safe_mail_error_tag(exc)
             logger.warning(
-                "后台刷新邮件缓存失败 account=%d folder=%s: %s",
-                account_id, folder, str(exc)[:150],
+                "后台刷新邮件缓存失败 account=%d folder=%s error=%s",
+                account_id, folder, error_msg,
             )
-        except Exception as exc:  # noqa: BLE001
-            error_msg = str(exc)[:200]
+        except Exception:  # noqa: BLE001
+            error_msg = "unexpected_error"
             logger.warning(
-                "后台刷新邮件缓存异常 account=%d folder=%s: %s",
-                account_id, folder, str(exc)[:150],
+                "后台刷新邮件缓存异常 account=%d folder=%s error=%s",
+                account_id, folder, error_msg,
             )
         finally:
             task.done(error=error_msg, item_count=item_count)

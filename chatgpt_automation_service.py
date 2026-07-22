@@ -7,7 +7,7 @@ from html import unescape
 from html.parser import HTMLParser
 import re
 
-from sqlalchemy import text
+from sqlalchemy import func, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -296,6 +296,74 @@ def complete_claim(db: Session, claim_token: str, now: int | None = None) -> dic
     claim.completed_at = completed_at
     db.commit()
     return {"ok": True, "status": "completed"}
+
+
+def reconcile_claim_registration(
+    db: Session,
+    claim_token: str,
+    email: str,
+    now: int | None = None,
+) -> dict:
+    reconciled_at = _now(now)
+    normalized_token = str(claim_token or "").strip()
+    normalized_email = str(email or "").strip().casefold()
+    if not normalized_token or not normalized_email:
+        raise _claim_error(
+            "invalid_reconciliation_request",
+            422,
+            "Reconciliation requires a claim token and mailbox",
+        )
+
+    if db.in_transaction():
+        db.rollback()
+    db.execute(text("BEGIN IMMEDIATE"))
+    claim = db.query(ChatgptEmailClaim).filter_by(claim_token=normalized_token).one_or_none()
+    account = None
+    if claim is not None:
+        account = db.query(MailAccount).filter_by(id=claim.mail_account_id).one_or_none()
+        if account is None:
+            db.rollback()
+            raise _claim_error("reconcile_account_not_found", 404, "Mailbox is unavailable")
+        if str(account.email or "").strip().casefold() != normalized_email:
+            db.rollback()
+            raise _claim_error(
+                "reconcile_account_mismatch",
+                409,
+                "Claim and mailbox do not match",
+            )
+    else:
+        account = (
+            db.query(MailAccount)
+            .filter(func.lower(MailAccount.email) == normalized_email)
+            .one_or_none()
+        )
+        if account is None:
+            db.rollback()
+            raise _claim_error("reconcile_account_not_found", 404, "Mailbox is unavailable")
+
+    claims = db.query(ChatgptEmailClaim).filter_by(mail_account_id=account.id).all()
+    receipt = None
+    for existing in claims:
+        if existing.claim_token == normalized_token:
+            receipt = existing
+        else:
+            db.delete(existing)
+
+    if receipt is None:
+        db.flush()
+        receipt = ChatgptEmailClaim(
+            mail_account_id=account.id,
+            claim_token=normalized_token,
+            claimed_at=reconciled_at,
+            expires_at=reconciled_at + COMPLETED_RECEIPT_SECONDS,
+        )
+        db.add(receipt)
+    receipt.status = "completed"
+    receipt.completed_at = reconciled_at
+    receipt.expires_at = max(receipt.expires_at, reconciled_at + COMPLETED_RECEIPT_SECONDS)
+    account.tags = append_exact_tag(account.tags, REGISTERED_TAG)
+    db.commit()
+    return {"ok": True, "status": "reconciled"}
 
 
 def release_claim(db: Session, claim_token: str) -> bool:

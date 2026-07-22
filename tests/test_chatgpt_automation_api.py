@@ -9,6 +9,7 @@ from fastapi import HTTPException
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+import icutool_mail as automation_api
 from chatgpt_automation_service import claim_email
 from database import Base
 from icutool_mail import (
@@ -20,7 +21,7 @@ from icutool_mail import (
     release_chatgpt_claim,
     require_automation_api_key,
 )
-from models import ApiKey, MailAccount
+from models import ApiKey, ChatgptEmailClaim, MailAccount
 
 
 class FakeRefreshTask:
@@ -99,28 +100,58 @@ class AutomationApiTest(unittest.TestCase):
         )
         self.assertEqual(set(response), {"code", "received_at", "folder"})
         self.assertEqual(response["code"], "919020")
-        self.assertEqual(len(refresh.call_args_list), 1)
-        self.assertEqual(refresh.call_args_list[0].args[:2], (account.id, "junk"))
+        self.assertEqual(
+            [call.args[:2] for call in refresh.call_args_list],
+            [(account.id, "inbox"), (account.id, "junk")],
+        )
 
     @patch("icutool_mail.refresh_mail_cache_async")
     @patch("icutool_mail.get_mail_cache")
     def test_verification_reuses_fresh_empty_caches_without_refresh(self, get_cache, refresh):
+        now = int(time.time())
         self.add_account("user@outlook.com")
-        claim_email(self.db, now=int(time.time()), token_factory=lambda: "claim-fresh-empty")
+        claim_email(self.db, now=now, token_factory=lambda: "claim-fresh-empty")
         get_cache.side_effect = [
-            {"items": [], "updated_at": int(time.time()), "is_fresh": True},
-            {"items": [], "updated_at": int(time.time()), "is_fresh": True},
+            {"items": [], "updated_at": now - 9, "is_fresh": True},
+            {"items": [], "updated_at": now - 9, "is_fresh": True},
         ]
 
-        response = get_chatgpt_verification_code(
-            ChatgptVerificationCodeBody(
-                claim_token="claim-fresh-empty", not_before=1784699250000
-            ),
-            db=self.db,
-        )
+        with patch("icutool_mail.time.time", return_value=now):
+            response = get_chatgpt_verification_code(
+                ChatgptVerificationCodeBody(
+                    claim_token="claim-fresh-empty", not_before=1784699250000
+                ),
+                db=self.db,
+            )
 
         self.assertEqual(response, {"code": "", "received_at": "", "folder": ""})
         refresh.assert_not_called()
+
+    @patch("icutool_mail.refresh_mail_cache_async")
+    @patch("icutool_mail.get_mail_cache")
+    def test_verification_refreshes_empty_caches_at_ten_second_boundary(self, get_cache, refresh):
+        now = int(time.time())
+        account = self.add_account("user@outlook.com")
+        claim_email(self.db, now=now, token_factory=lambda: "claim-cooldown")
+        expired_empty = {"items": [], "updated_at": now - 10, "is_fresh": True}
+        refreshed_empty = {"items": [], "updated_at": now, "is_fresh": True}
+        get_cache.side_effect = [expired_empty, expired_empty, refreshed_empty, refreshed_empty]
+        refresh.side_effect = [FakeRefreshTask(), FakeRefreshTask()]
+
+        with patch("icutool_mail.time.time", return_value=now):
+            response = get_chatgpt_verification_code(
+                ChatgptVerificationCodeBody(
+                    claim_token="claim-cooldown", not_before=1784699250000
+                ),
+                db=self.db,
+            )
+
+        self.assertEqual(response, {"code": "", "received_at": "", "folder": ""})
+        self.assertEqual(
+            [call.args[:2] for call in refresh.call_args_list],
+            [(account.id, "inbox"), (account.id, "junk")],
+        )
+        self.assertEqual(get_cache.call_count, 4)
 
     @patch("icutool_mail.refresh_mail_cache_async")
     @patch("icutool_mail.get_mail_cache")
@@ -207,3 +238,26 @@ class AutomationApiTest(unittest.TestCase):
             release_chatgpt_claim(ChatgptClaimTokenBody(claim_token="release"), db=self.db),
             {"ok": True, "released": False},
         )
+
+    def test_reconcile_route_quarantines_registration_with_minimal_receipt(self):
+        self.assertTrue(
+            hasattr(automation_api, "ChatgptReconcileBody")
+            and hasattr(automation_api, "reconcile_chatgpt_claim"),
+            "authenticated reconciliation API is missing",
+        )
+        account = self.add_account("user@outlook.com")
+        claim_email(self.db, now=1000, token_factory=lambda: "lost-claim")
+        self.db.query(ChatgptEmailClaim).delete()
+        self.db.commit()
+
+        response = automation_api.reconcile_chatgpt_claim(
+            automation_api.ChatgptReconcileBody(
+                claim_token="lost-claim",
+                email="user@outlook.com",
+            ),
+            db=self.db,
+        )
+
+        self.db.refresh(account)
+        self.assertEqual(response, {"ok": True, "status": "reconciled"})
+        self.assertIn("已注册chatgpt", account.tags)

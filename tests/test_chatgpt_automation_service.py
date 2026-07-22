@@ -2,12 +2,19 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 
 from database import Base
 from models import ChatgptEmailClaim, MailAccount
+import chatgpt_automation_service as automation_service
+import icutool_mail
+import mail_cache_service
+import mail_service
+from oauth_service import OAuthServiceError
 from chatgpt_automation_service import (
     AutomationError,
     append_exact_tag,
@@ -211,6 +218,67 @@ class ClaimServiceTest(unittest.TestCase):
         self.assertEqual(caught.exception.code, "no_available_email")
         self.assertEqual(caught.exception.status_code, 409)
 
+    def test_reconcile_registration_invalidates_newer_claim_and_is_idempotent(self):
+        self.assertTrue(
+            hasattr(automation_service, "reconcile_claim_registration"),
+            "registration reconciliation service is missing",
+        )
+        self.add_account("user@example.com", "vip")
+        with self.Session() as db:
+            claim_email(db, now=1000, token_factory=lambda: "old-token")
+            release_claim(db, "old-token")
+            claim_email(db, now=1001, token_factory=lambda: "new-token")
+
+            first = automation_service.reconcile_claim_registration(
+                db,
+                "old-token",
+                "user@example.com",
+                now=1100,
+            )
+            second = automation_service.reconcile_claim_registration(
+                db,
+                "old-token",
+                "user@example.com",
+                now=1101,
+            )
+            claims = [
+                (claim.claim_token, claim.status)
+                for claim in db.query(ChatgptEmailClaim).all()
+            ]
+            with self.assertRaises(AutomationError) as caught:
+                claim_email(db, now=90000, token_factory=lambda: "reused-token")
+            account_tags = db.query(MailAccount).filter_by(email="user@example.com").one().tags
+
+        self.assertEqual(first, {"ok": True, "status": "reconciled"})
+        self.assertEqual(second, first)
+        self.assertEqual(account_tags, "vip,已注册chatgpt")
+        self.assertEqual(len(claims), 1)
+        self.assertEqual(claims[0], ("old-token", "completed"))
+        self.assertEqual(caught.exception.code, "no_available_email")
+
+    def test_reconcile_rejects_token_bound_to_another_mailbox(self):
+        self.assertTrue(
+            hasattr(automation_service, "reconcile_claim_registration"),
+            "registration reconciliation service is missing",
+        )
+        self.add_account("first@example.com")
+        self.add_account("second@example.com")
+        with self.Session() as db:
+            claim_email(db, now=1000, token_factory=lambda: "first-token")
+            with self.assertRaises(AutomationError) as caught:
+                automation_service.reconcile_claim_registration(
+                    db,
+                    "first-token",
+                    "second@example.com",
+                    now=1001,
+                )
+            first = db.query(MailAccount).filter_by(email="first@example.com").one()
+            second = db.query(MailAccount).filter_by(email="second@example.com").one()
+
+        self.assertEqual(caught.exception.code, "reconcile_account_mismatch")
+        self.assertEqual(first.tags, "")
+        self.assertEqual(second.tags, "")
+
     def test_two_threads_claim_two_distinct_accounts(self):
         self.add_account("first@example.com")
         self.add_account("second@example.com")
@@ -249,6 +317,97 @@ class TagHelpersTest(unittest.TestCase):
             append_exact_tag(" vip，测试, vip ", "已注册chatgpt"),
             "vip,测试,已注册chatgpt",
         )
+
+
+class SensitiveLogTest(unittest.TestCase):
+    def test_account_preheat_logs_neither_email_nor_oauth_error(self):
+        account = SimpleNamespace(
+            id=9,
+            email="private@example.com",
+            refresh_token="refresh-secret",
+        )
+        session = Mock()
+        session.__enter__ = Mock(return_value=session)
+        session.__exit__ = Mock(return_value=False)
+        session.query.return_value.filter.return_value.first.return_value = account
+
+        with (
+            patch.object(icutool_mail, "SessionLocal", return_value=session),
+            patch.object(
+                icutool_mail,
+                "get_valid_access_token",
+                side_effect=OAuthServiceError("token=refresh-secret password=hunter2"),
+            ),
+            patch.object(icutool_mail.logger, "warning") as warning,
+        ):
+            icutool_mail.preheat_accounts_async([9])
+            for _ in range(100):
+                if warning.called:
+                    break
+                threading.Event().wait(0.01)
+
+        logged = repr(warning.call_args_list)
+        self.assertIn("oauth_token_failed", logged)
+        self.assertNotIn("private@example.com", logged)
+        self.assertNotIn("refresh-secret", logged)
+        self.assertNotIn("hunter2", logged)
+
+    def test_protocol_fallback_logs_only_account_id_and_stable_error_tag(self):
+        account = SimpleNamespace(
+            id=42,
+            email="private@example.com",
+            protocol="auto",
+            last_used_protocol="",
+            refresh_token="refresh-secret",
+            client_id="client-secret",
+            password="password-secret",
+        )
+        db = Mock()
+        provider_error = mail_service.MailServiceError(
+            "provider rejected password=password-secret token=refresh-secret",
+            tag="imap_auth_failed",
+        )
+
+        with (
+            patch.object(mail_service, "_can_use_protocol", return_value=True),
+            patch.object(mail_service, "_load_by_protocol_name", side_effect=provider_error),
+            patch.object(mail_service.logger, "info") as info,
+            patch.object(mail_service.logger, "warning") as warning,
+            self.assertRaises(mail_service.MailServiceError),
+        ):
+            mail_service._load_with_protocol_selection(account, db)
+
+        logged = repr(info.call_args_list + warning.call_args_list)
+        self.assertIn("42", logged)
+        self.assertIn("imap_auth_failed", logged)
+        self.assertNotIn("private@example.com", logged)
+        self.assertNotIn("password-secret", logged)
+        self.assertNotIn("refresh-secret", logged)
+
+    def test_background_refresh_logs_neither_email_nor_provider_error(self):
+        account = SimpleNamespace(id=7, email="private@example.com")
+        session = Mock()
+        session.__enter__ = Mock(return_value=session)
+        session.__exit__ = Mock(return_value=False)
+        session.query.return_value.filter.return_value.first.return_value = account
+        provider_error = mail_service.MailServiceError(
+            "provider returned verification=919020 token=refresh-secret",
+            tag="token_invalid",
+        )
+
+        with (
+            patch("database.SessionLocal", return_value=session),
+            patch("mail_service.load_account_mails", side_effect=provider_error),
+            patch.object(mail_cache_service.logger, "warning") as warning,
+        ):
+            task = mail_cache_service.refresh_mail_cache_async(7, "inbox", force=True)
+            self.assertTrue(task.event.wait(timeout=5))
+
+        logged = repr(warning.call_args_list)
+        self.assertIn("token_invalid", logged)
+        self.assertNotIn("private@example.com", logged)
+        self.assertNotIn("919020", logged)
+        self.assertNotIn("refresh-secret", logged)
 
 
 def matching_mail(code="919020", received="2026-07-22 13:48:45"):

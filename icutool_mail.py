@@ -37,6 +37,7 @@ from chatgpt_automation_service import (
     claim_email,
     complete_claim,
     find_latest_chatgpt_code,
+    reconcile_claim_registration,
     release_claim,
     renew_claim,
     resolve_active_claim,
@@ -191,6 +192,23 @@ class ChatgptClaimTokenBody(BaseModel):
 
 class ChatgptVerificationCodeBody(ChatgptClaimTokenBody):
     not_before: int
+
+
+class ChatgptReconcileBody(ChatgptClaimTokenBody):
+    email: str
+
+
+AUTOMATION_CACHE_REFRESH_COOLDOWN_SECONDS = 10
+
+
+def _automation_cache_is_recent(cache: dict | None, now: int) -> bool:
+    if not cache:
+        return False
+    try:
+        age = int(now) - int(cache.get("updated_at", 0))
+    except (TypeError, ValueError):
+        return False
+    return 0 <= age < AUTOMATION_CACHE_REFRESH_COOLDOWN_SECONDS
 
 
 def get_db():
@@ -442,10 +460,11 @@ def get_chatgpt_verification_code(
 
     folders = ("inbox", "junk")
     caches = {folder: get_mail_cache(db, account.id, folder) for folder in folders}
+    cache_now = int(time.time())
     tasks = {
         folder: refresh_mail_cache_async(account.id, folder, limit=10)
         for folder in folders
-        if not caches[folder] or not caches[folder].get("is_fresh", False)
+        if not _automation_cache_is_recent(caches[folder], cache_now)
     }
     match = find_latest_chatgpt_code(
         {folder: (cache or {}).get("items", []) for folder, cache in caches.items()},
@@ -493,6 +512,20 @@ def complete_chatgpt_claim(
 ):
     try:
         return complete_claim(db, body.claim_token)
+    except AutomationError as exc:
+        raise _automation_http_error(exc) from exc
+
+
+@app.post(
+    "/api/automation/chatgpt/claims/reconcile",
+    dependencies=[Depends(require_automation_api_key)],
+)
+def reconcile_chatgpt_claim(
+    body: ChatgptReconcileBody,
+    db: Session = Depends(get_db),
+):
+    try:
+        return reconcile_claim_registration(db, body.claim_token, body.email)
     except AutomationError as exc:
         raise _automation_http_error(exc) from exc
 
@@ -635,14 +668,17 @@ def preheat_accounts_async(account_ids: list[int], folder: str = "inbox", limit:
                 # 1) 先预热 OAuth token:忽略已缓存的,强制刷新一次,提前暴露 token 问题
                 try:
                     get_valid_access_token(account, db)
-                except OAuthServiceError as exc:
-                    logger.warning("账号 %s 预热 token 失败: %s", account.email, str(exc)[:200])
+                except OAuthServiceError:
+                    logger.warning(
+                        "账号 id=%s 预热 token 失败: error=oauth_token_failed",
+                        account_id,
+                    )
                     return False
                 # 2) 触发后台邮件缓存刷新(非阻塞,内部去重)
                 refresh_mail_cache_async(account_id, folder, limit=limit, force=False)
                 return True
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("账号 id=%s 预热失败: %s", account_id, str(exc)[:200])
+        except Exception:  # noqa: BLE001
+            logger.warning("账号 id=%s 预热失败: error=unexpected_error", account_id)
             return False
 
     def runner() -> None:
@@ -651,8 +687,8 @@ def preheat_accounts_async(account_ids: list[int], folder: str = "inbox", limit:
                 futures = [pool.submit(preheat_one, account_id) for account_id in account_ids]
                 for _ in as_completed(futures, timeout=120):
                     pass
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("预热账号池异常: %s", str(exc)[:200])
+        except Exception:  # noqa: BLE001
+            logger.warning("预热账号池异常: error=unexpected_error")
 
     threading.Thread(target=runner, name="preheat-accounts", daemon=True).start()
 

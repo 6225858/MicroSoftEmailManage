@@ -66,6 +66,29 @@ class MailServiceError(Exception):
         self.tag = tag
 
 
+SAFE_MAIL_LOG_TAGS = frozenset({
+    "auth_missing",
+    "imap_auth_failed",
+    "missing_credentials_for_graph",
+    "missing_credentials_for_imap",
+    "missing_credentials_for_pop3",
+    "no_available_protocol",
+    "oauth_token_failed",
+    "pop3_auth_failed",
+    "token_invalid",
+})
+
+
+def safe_mail_error_tag(error: BaseException) -> str:
+    tag = str(getattr(error, "tag", "") or "")
+    return tag if tag in SAFE_MAIL_LOG_TAGS else "mail_service_error"
+
+
+def _account_log_id(account: MailAccount) -> str:
+    account_id = getattr(account, "id", None)
+    return str(account_id) if account_id is not None else "unknown"
+
+
 PRE_CONTENT_PATTERN = re.compile(r"^<pre[^>]*>([\s\S]*)</pre>$", re.IGNORECASE)
 
 
@@ -254,8 +277,8 @@ def _graph_request(
             graph_error = response.text[:200]
 
         logger.info(
-            "邮箱 %s Graph API 401（token scope: %s），将 fallback 到 IMAP",
-            account.email, token_scope[:80] or "(无法解析)",
+            "邮箱 account=%s Graph API 401，error=token_invalid，将 fallback 到 IMAP",
+            _account_log_id(account),
         )
         raise MailServiceError(
             f"Graph API 401（token scope: {token_scope[:80] or '未知'}, "
@@ -400,8 +423,8 @@ def _can_use_protocol(protocol: str, account: MailAccount) -> bool:
         has_creds = bool((account.refresh_token or "").strip() and (account.client_id or "").strip())
         if not has_creds:
             logger.warning(
-                "邮箱 %s Graph 协议不可用: refresh_token=%s, client_id=%s",
-                account.email,
+                "邮箱 account=%s Graph 协议不可用: refresh_token=%s, client_id=%s",
+                _account_log_id(account),
                 "有" if (account.refresh_token or "").strip() else "空",
                 "有" if (account.client_id or "").strip() else "空",
             )
@@ -450,15 +473,15 @@ def _load_with_protocol_selection(
         # 跳过没有凭据的协议
         if not _can_use_protocol(protocol, account):
             logger.info(
-                "邮箱 %s 跳过 %s 协议（缺少凭据）",
-                account.email, protocol.upper(),
+                "邮箱 account=%s 跳过 %s 协议（缺少凭据）",
+                _account_log_id(account), protocol.upper(),
             )
             continue
 
         tried.append(protocol)
         logger.info(
-            "邮箱 %s 尝试 %s 协议取件",
-            account.email, protocol.upper(),
+            "邮箱 account=%s 尝试 %s 协议取件",
+            _account_log_id(account), protocol.upper(),
         )
 
         try:
@@ -472,16 +495,16 @@ def _load_with_protocol_selection(
                 _remove_tag(account, "pop3_auth_failed")
                 db.commit()
                 logger.info(
-                    "邮箱 %s %s 协议取件成功，已记录到 last_used_protocol",
-                    account.email, protocol.upper(),
+                    "邮箱 account=%s %s 协议取件成功，已记录到 last_used_protocol",
+                    _account_log_id(account), protocol.upper(),
                 )
             return items
         except MailServiceError as exc:
             last_error = exc
             errors.append(f"{protocol.upper()}: {exc.message}")
             logger.warning(
-                "邮箱 %s %s 协议取件失败: %s",
-                account.email, protocol.upper(), str(exc)[:150],
+                "邮箱 account=%s %s 协议取件失败: error=%s",
+                _account_log_id(account), protocol.upper(), safe_mail_error_tag(exc),
             )
             # 自动选择模式下：任何错误都继续尝试下一个协议
             continue
@@ -832,8 +855,8 @@ def load_imap_messages(
             # OAuth2 失败时若仍有密码，fallback 到密码认证
             if password:
                 logger.warning(
-                    "邮箱 %s IMAP OAuth2 取 token 失败，回退到密码认证: %s",
-                    account.email, str(exc)[:150],
+                    "邮箱 account=%s IMAP OAuth2 取 token 失败，回退到密码认证: error=oauth_token_failed",
+                    _account_log_id(account),
                 )
                 use_oauth2 = False
             else:
@@ -851,7 +874,7 @@ def load_imap_messages(
     # 获取代理 socket 工厂（如果有可用代理）
     proxy_factory = get_proxied_socket_factory(db)
     if proxy_factory:
-        logger.info("邮箱 %s IMAP 使用代理连接 %s:%s", account.email, server, port)
+        logger.info("邮箱 account=%s IMAP 使用代理连接 %s:%s", _account_log_id(account), server, port)
 
     try:
         if use_ssl:
@@ -878,8 +901,8 @@ def load_imap_messages(
                 # XOAUTH2 失败时如果有密码，fallback 到密码
                 if password:
                     logger.warning(
-                        "邮箱 %s IMAP XOAUTH2 认证失败，回退到密码认证: %s",
-                        account.email, str(exc)[:150],
+                        "邮箱 account=%s IMAP XOAUTH2 认证失败，回退到密码认证: error=imap_auth_failed",
+                        _account_log_id(account),
                     )
                     mail.login(account.email, password)
                 else:
@@ -972,8 +995,8 @@ def load_pop3_messages(
             # OAuth2 失败时若仍有密码，fallback 到密码认证
             if password:
                 logger.warning(
-                    "邮箱 %s POP3 OAuth2 取 token 失败，回退到密码认证: %s",
-                    account.email, str(exc)[:150],
+                    "邮箱 account=%s POP3 OAuth2 取 token 失败，回退到密码认证: error=oauth_token_failed",
+                    _account_log_id(account),
                 )
                 use_oauth2 = False
             else:
@@ -991,7 +1014,7 @@ def load_pop3_messages(
     # 获取代理 socket 工厂（如果有可用代理）
     proxy_factory = get_proxied_socket_factory(db)
     if proxy_factory:
-        logger.info("邮箱 %s POP3 使用代理连接 %s:%s", account.email, server, port)
+        logger.info("邮箱 account=%s POP3 使用代理连接 %s:%s", _account_log_id(account), server, port)
 
     try:
         if use_ssl:
@@ -1016,7 +1039,7 @@ def load_pop3_messages(
                 auth_string = f"user={account.email}\x01auth=Bearer {access_token}\x01\x01"
                 encoded_auth = base64.b64encode(auth_string.encode("utf-8")).decode("ascii")
                 pop._shortcmd(f"AUTH XOAUTH2 {encoded_auth}")
-                logger.info("邮箱 %s POP3 XOAUTH2 认证成功", account.email)
+                logger.info("邮箱 account=%s POP3 XOAUTH2 认证成功", _account_log_id(account))
             except poplib.error_proto as exc:
                 # XOAUTH2 失败:服务器可能返回 continuation response(+ <base64_error>)
                 # 必须发送空行清除 continuation 状态,否则连接处于脏状态
@@ -1035,8 +1058,8 @@ def load_pop3_messages(
                 # 有密码 → 关闭旧连接,重新连接后用密码认证
                 # (不能在旧连接上直接 USER/PASS,因为 XOAUTH2 失败后连接状态已脏)
                 logger.warning(
-                    "邮箱 %s POP3 XOAUTH2 认证失败(%s),重新连接后用密码认证",
-                    account.email, str(exc)[:120],
+                    "邮箱 account=%s POP3 XOAUTH2 认证失败(error=pop3_auth_failed),重新连接后用密码认证",
+                    _account_log_id(account),
                 )
                 try:
                     pop.quit()
@@ -1061,7 +1084,7 @@ def load_pop3_messages(
                 try:
                     pop.user(account.email)
                     pop.pass_(password)
-                    logger.info("邮箱 %s POP3 密码认证成功", account.email)
+                    logger.info("邮箱 account=%s POP3 密码认证成功", _account_log_id(account))
                 except poplib.error_proto as exc2:
                     raise MailServiceError(
                         f"POP3 login failed: {exc2}",
