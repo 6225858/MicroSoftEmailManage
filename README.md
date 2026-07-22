@@ -20,13 +20,13 @@
 
 
 ### 账号管理界面
-<img src="./img/manage.png" width="800" />
+<img src="./img/manage.png?raw=true" width="800" />
 
 ### 邮件查看界面
-<img src="./img/mailView.png" width="800" />
+<img src="./img/mailView.png?raw=true" width="800" />
 
 ### 日志界面（支持折叠显示）
-<img src="./img/log.png" width="800" />
+<img src="./img/log.png?raw=true" width="800" />
 
 ---
 
