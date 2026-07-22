@@ -41,6 +41,48 @@ logger.setLevel(logging.INFO)
 logger.propagate = False
 
 
+_OAUTH_ENDPOINT_CATEGORIES = {
+    TOKEN_URL_CONSUMER: "consumer",
+    TOKEN_URL_COMMON: "common",
+    MSAUTH_TOKEN_URL: "msauth",
+    "token_store": "token_store",
+    "all": "all",
+}
+_OAUTH_LOG_TAGS = frozenset({
+    "all_endpoints_failed",
+    "fallback_to_msauth",
+    "http_error",
+    "missing_mail_read",
+    "network_retry",
+    "provider_error",
+    "refresh_attempt",
+    "refresh_failed",
+    "refresh_succeeded",
+    "token_rotated",
+})
+
+
+def _oauth_log(level: int, *, account_id, endpoint: str, attempt: int, tag: str) -> None:
+    endpoint_category = _OAUTH_ENDPOINT_CATEGORIES.get(endpoint, "all")
+    safe_tag = tag if tag in _OAUTH_LOG_TAGS else "refresh_failed"
+    try:
+        safe_account_id = int(account_id)
+    except (TypeError, ValueError):
+        safe_account_id = 0
+    try:
+        safe_attempt = max(0, int(attempt))
+    except (TypeError, ValueError):
+        safe_attempt = 0
+    logger.log(
+        level,
+        "oauth account_id=%d endpoint=%s attempt=%d tag=%s",
+        safe_account_id,
+        endpoint_category,
+        safe_attempt,
+        safe_tag,
+    )
+
+
 class OAuthServiceError(Exception):
     pass
 
@@ -54,7 +96,15 @@ _NETWORK_RETRYABLE_EXC = (
 )
 
 
-def _post_with_retry(url: str, *, data, timeout: int, proxies=None, retries: int = 2):
+def _post_with_retry(
+    url: str,
+    *,
+    data,
+    timeout: int,
+    proxies=None,
+    retries: int = 2,
+    account_id=0,
+):
     """带瞬时网络错误重试的 POST 请求。
 
     只对连接错误 / 超时 / 代理瞬时不可用重试,不对 HTTP 4xx/5xx 重试
@@ -67,11 +117,14 @@ def _post_with_retry(url: str, *, data, timeout: int, proxies=None, retries: int
         except _NETWORK_RETRYABLE_EXC as exc:
             last_exc = exc
             if attempt < retries:
-                sleep_sec = 1.0 * (attempt + 1)
-                logger.info(
-                    "OAuth 请求网络错误, %.1fs 后重试 (attempt=%d/%d): %s",
-                    sleep_sec, attempt + 1, retries, str(exc)[:120],
+                _oauth_log(
+                    logging.INFO,
+                    account_id=account_id,
+                    endpoint=url,
+                    attempt=attempt + 1,
+                    tag="network_retry",
                 )
+                sleep_sec = 1.0 * (attempt + 1)
                 time.sleep(sleep_sec)
                 continue
             raise
@@ -121,7 +174,7 @@ def _try_oauth2_refresh(token_url: str, account: MailAccount, proxies: dict | No
 
     last_error: OAuthServiceError | None = None
 
-    for scope in candidate_scopes:
+    for attempt, scope in enumerate(candidate_scopes, start=1):
         request_data = {
             "client_id": account.client_id,
             "grant_type": "refresh_token",
@@ -131,9 +184,22 @@ def _try_oauth2_refresh(token_url: str, account: MailAccount, proxies: dict | No
             request_data["scope"] = scope
 
         try:
-            response = _post_with_retry(token_url, data=request_data, timeout=20, proxies=proxies)
+            response = _post_with_retry(
+                token_url,
+                data=request_data,
+                timeout=20,
+                proxies=proxies,
+                account_id=account.id,
+            )
         except requests.RequestException as exc:
             last_error = OAuthServiceError(f"network error: {exc}")
+            _oauth_log(
+                logging.WARNING,
+                account_id=account.id,
+                endpoint=token_url,
+                attempt=attempt,
+                tag="refresh_failed",
+            )
             continue
 
         if not response.ok:
@@ -146,9 +212,12 @@ def _try_oauth2_refresh(token_url: str, account: MailAccount, proxies: dict | No
             last_error = OAuthServiceError(
                 f"HTTP {response.status_code}: {error_detail} (endpoint: {token_url})"
             )
-            logger.debug(
-                "邮箱 %s 端点 %s scope=%r 刷新失败: %s",
-                account.email, token_url, scope, error_detail[:120],
+            _oauth_log(
+                logging.DEBUG,
+                account_id=account.id,
+                endpoint=token_url,
+                attempt=attempt,
+                tag="http_error",
             )
             continue
 
@@ -157,10 +226,24 @@ def _try_oauth2_refresh(token_url: str, account: MailAccount, proxies: dict | No
             last_error = OAuthServiceError(
                 payload.get("error_description") or payload["error"]
             )
+            _oauth_log(
+                logging.WARNING,
+                account_id=account.id,
+                endpoint=token_url,
+                attempt=attempt,
+                tag="provider_error",
+            )
             continue
 
         if not payload.get("access_token"):
             last_error = OAuthServiceError("token response missing access_token")
+            _oauth_log(
+                logging.WARNING,
+                account_id=account.id,
+                endpoint=token_url,
+                attempt=attempt,
+                tag="provider_error",
+            )
             continue
 
         # 关键：验证返回的 token 实际包含 Mail.Read 权限
@@ -170,26 +253,25 @@ def _try_oauth2_refresh(token_url: str, account: MailAccount, proxies: dict | No
 
         if not has_mail_read and not relax_scope_check:
             # 严格模式：token 缺少 Mail.Read 权限，跳过
-            logger.warning(
-                "邮箱 %s 端点 %s scope=%r 刷新成功但 token 不含 Mail.Read（实际 scope: %s），跳过",
-                account.email, token_url, scope, granted_scope[:200],
+            _oauth_log(
+                logging.WARNING,
+                account_id=account.id,
+                endpoint=token_url,
+                attempt=attempt,
+                tag="missing_mail_read",
             )
             last_error = OAuthServiceError(
                 f"刷新成功但 token 缺少 Mail.Read 权限（实际 scope: {granted_scope[:100]}）"
             )
             continue
 
-        if not has_mail_read and relax_scope_check:
-            # 放宽模式：scope 字段不含 Mail.Read，但不拒绝（让 Graph API 自行验证）
-            logger.info(
-                "邮箱 %s 端点 %s scope=%r 刷新成功（scope 不含 Mail.Read: %s），放宽模式继续",
-                account.email, token_url, scope, granted_scope[:200],
-            )
-
         # 成功
-        logger.info(
-            "邮箱 %s 端点 %s 刷新成功（scope=%r, granted=%s）",
-            account.email, token_url, scope, granted_scope[:80],
+        _oauth_log(
+            logging.INFO,
+            account_id=account.id,
+            endpoint=token_url,
+            attempt=attempt,
+            tag="refresh_succeeded",
         )
         return payload
 
@@ -236,23 +318,42 @@ def _try_msauth_refresh(account: MailAccount, proxies: dict | None) -> dict:
     last_error: OAuthServiceError | None = None
     for idx, req_data in enumerate(candidates):
         req_data_full = {"client_id": account.client_id, **req_data}
-        scope_desc = req_data.get("scope", "")
-        grant_desc = req_data.get("grant_type", "")
-        logger.info(
-            "邮箱 %s MSAuth 尝试 %d/%d: grant=%s scope=%s",
-            account.email, idx + 1, len(candidates), grant_desc, scope_desc,
+        _oauth_log(
+            logging.INFO,
+            account_id=account.id,
+            endpoint=MSAUTH_TOKEN_URL,
+            attempt=idx + 1,
+            tag="refresh_attempt",
         )
-        response = _post_with_retry(MSAUTH_TOKEN_URL, data=req_data_full, timeout=20, proxies=proxies)
+        response = _post_with_retry(
+            MSAUTH_TOKEN_URL,
+            data=req_data_full,
+            timeout=20,
+            proxies=proxies,
+            account_id=account.id,
+        )
 
         if response.ok:
             payload = response.json()
             if not payload.get("error") and payload.get("access_token"):
-                logger.info("邮箱 %s MSAuth 刷新成功 (grant=%s scope=%s)",
-                            account.email, grant_desc, scope_desc)
+                _oauth_log(
+                    logging.INFO,
+                    account_id=account.id,
+                    endpoint=MSAUTH_TOKEN_URL,
+                    attempt=idx + 1,
+                    tag="refresh_succeeded",
+                )
                 return payload
             # 响应 200 但有 error 字段
             err_msg = payload.get("error_description") or payload.get("error") or ""
             last_error = OAuthServiceError(f"MSAuth error: {err_msg}")
+            _oauth_log(
+                logging.WARNING,
+                account_id=account.id,
+                endpoint=MSAUTH_TOKEN_URL,
+                attempt=idx + 1,
+                tag="provider_error",
+            )
             continue
 
         error_detail = ""
@@ -264,9 +365,12 @@ def _try_msauth_refresh(account: MailAccount, proxies: dict | None) -> dict:
         last_error = OAuthServiceError(
             f"HTTP {response.status_code}: {error_detail} (endpoint: {MSAUTH_TOKEN_URL})"
         )
-        logger.warning(
-            "邮箱 %s MSAuth 尝试 %d 失败 (grant=%s scope=%s): %s",
-            account.email, idx + 1, grant_desc, scope_desc, error_detail[:120],
+        _oauth_log(
+            logging.WARNING,
+            account_id=account.id,
+            endpoint=MSAUTH_TOKEN_URL,
+            attempt=idx + 1,
+            tag="http_error",
         )
 
     raise last_error or OAuthServiceError("MSAuth refresh failed (unknown)")
@@ -276,7 +380,13 @@ def _store_tokens(account: MailAccount, db: Session, access_token: str, new_refr
     old_refresh_token = _sanitize_token(account.refresh_token)
 
     if new_refresh_token and new_refresh_token != old_refresh_token:
-        logger.info("邮箱 %s 收到新的 refresh_token", account.email)
+        _oauth_log(
+            logging.INFO,
+            account_id=account.id,
+            endpoint="token_store",
+            attempt=0,
+            tag="token_rotated",
+        )
         if old_refresh_token:
             db.add(
                 MailRefreshTokenHistory(
@@ -315,7 +425,7 @@ def get_valid_access_token(account: MailAccount, db: Session) -> str:
     # 先尝试标准 OAuth2 端点（放宽 scope 验证）→ 如果成功且 token 有 Mail.Read，Graph API 直接可用
     # 失败 → fallback 到 MSAuth 端点 → 返回 wl.imap scope token → 仅 IMAP XOAUTH2 可用
     if is_msauth:
-        for token_url in (TOKEN_URL_CONSUMER, TOKEN_URL_COMMON):
+        for endpoint_attempt, token_url in enumerate((TOKEN_URL_CONSUMER, TOKEN_URL_COMMON), start=1):
             try:
                 payload = _try_oauth2_refresh(token_url, account, proxies, relax_scope_check=True)
                 access_token = payload["access_token"]
@@ -326,10 +436,22 @@ def get_valid_access_token(account: MailAccount, db: Session) -> str:
                 return access_token
             except OAuthServiceError as exc:
                 last_error = exc
-                logger.warning("邮箱 %s 端点 %s 刷新失败: %s", account.email, token_url, str(exc)[:200])
+                _oauth_log(
+                    logging.WARNING,
+                    account_id=account.id,
+                    endpoint=token_url,
+                    attempt=endpoint_attempt,
+                    tag="refresh_failed",
+                )
 
         # 标准 OAuth2 端点全部失败 → MSAuth 端点
-        logger.info("邮箱 %s 标准 OAuth2 端点失败，尝试 MSAuth 端点刷新", account.email)
+        _oauth_log(
+            logging.INFO,
+            account_id=account.id,
+            endpoint=MSAUTH_TOKEN_URL,
+            attempt=1,
+            tag="fallback_to_msauth",
+        )
         try:
             payload = _try_msauth_refresh(account, proxies)
             access_token = payload["access_token"]
@@ -340,13 +462,16 @@ def get_valid_access_token(account: MailAccount, db: Session) -> str:
             return access_token
         except OAuthServiceError as exc:
             last_error = exc
-            logger.warning(
-                "邮箱 %s MSAuth 端点刷新也失败: %s",
-                account.email, str(exc)[:200],
+            _oauth_log(
+                logging.WARNING,
+                account_id=account.id,
+                endpoint=MSAUTH_TOKEN_URL,
+                attempt=1,
+                tag="refresh_failed",
             )
     else:
         # 非 MSAuth token：标准 OAuth2 端点（严格 scope 验证）
-        for token_url in (TOKEN_URL_CONSUMER, TOKEN_URL_COMMON):
+        for endpoint_attempt, token_url in enumerate((TOKEN_URL_CONSUMER, TOKEN_URL_COMMON), start=1):
             try:
                 payload = _try_oauth2_refresh(token_url, account, proxies)
                 access_token = payload["access_token"]
@@ -357,7 +482,19 @@ def get_valid_access_token(account: MailAccount, db: Session) -> str:
                 return access_token
             except OAuthServiceError as exc:
                 last_error = exc
-                logger.warning("邮箱 %s 端点 %s 刷新失败: %s", account.email, token_url, str(exc)[:200])
+                _oauth_log(
+                    logging.WARNING,
+                    account_id=account.id,
+                    endpoint=token_url,
+                    attempt=endpoint_attempt,
+                    tag="refresh_failed",
+                )
 
-    logger.error("邮箱 %s OAuth 刷新失败（所有端点均失败）", account.email)
+    _oauth_log(
+        logging.ERROR,
+        account_id=account.id,
+        endpoint="all",
+        attempt=0,
+        tag="all_endpoints_failed",
+    )
     raise last_error or OAuthServiceError("unknown token refresh error")

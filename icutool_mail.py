@@ -29,9 +29,19 @@ from mail_cache_service import (
     is_refreshing,
     cancel_refresh_for_account,
 )
-from models import ApiKey, MailAccount, MailCache, Proxy, TokenRefreshLog
+from models import ApiKey, ChatgptEmailClaim, MailAccount, MailCache, Proxy, TokenRefreshLog
 from oauth_service import OAuthServiceError, get_valid_access_token
 from proxy_service import import_proxy_line, test_proxies_status
+from chatgpt_automation_service import (
+    AutomationError,
+    claim_email,
+    complete_claim,
+    find_latest_chatgpt_code,
+    reconcile_claim_registration,
+    release_claim,
+    renew_claim,
+    resolve_active_claim,
+)
 
 logger = logging.getLogger("icutool_mail")
 
@@ -176,6 +186,31 @@ class ApiKeyBody(BaseModel):
     name: str
 
 
+class ChatgptClaimTokenBody(BaseModel):
+    claim_token: str
+
+
+class ChatgptVerificationCodeBody(ChatgptClaimTokenBody):
+    not_before: int
+
+
+class ChatgptReconcileBody(ChatgptClaimTokenBody):
+    email: str
+
+
+AUTOMATION_CACHE_REFRESH_COOLDOWN_SECONDS = 10
+
+
+def _automation_cache_is_recent(cache: dict | None, now: int) -> bool:
+    if not cache:
+        return False
+    try:
+        age = int(now) - int(cache.get("updated_at", 0))
+    except (TypeError, ValueError):
+        return False
+    return 0 <= age < AUTOMATION_CACHE_REFRESH_COOLDOWN_SECONDS
+
+
 def get_db():
     db = SessionLocal()
     try:
@@ -196,6 +231,22 @@ def require_api_key(
             db.commit()
             return
         raise HTTPException(status_code=401, detail="invalid api key")
+
+
+def require_automation_api_key(
+    x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key"),
+    db: Session = Depends(get_db),
+):
+    value = (x_api_key or "").strip()
+    record = db.query(ApiKey).filter(ApiKey.key == value).first() if value else None
+    if record is None:
+        raise HTTPException(status_code=401, detail={
+            "code": "invalid_api_key",
+            "message": "API Key missing or invalid",
+        })
+    record.last_used_at = int(time.time())
+    db.commit()
+    return record
 
 
 def normalize_tags(tags: str) -> str:
@@ -291,10 +342,55 @@ def ensure_proxy_schema() -> None:
                     conn.exec_driver_sql(f"ALTER TABLE proxy ADD COLUMN {col} {coltype}")
 
 
+def ensure_chatgpt_email_claim_schema() -> None:
+    with engine.begin() as conn:
+        conn.exec_driver_sql("""
+            CREATE TABLE IF NOT EXISTS chatgpt_email_claim (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                mail_account_id INTEGER NOT NULL,
+                claim_token TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                claimed_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                completed_at INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+        columns = {
+            row[1]
+            for row in conn.exec_driver_sql("PRAGMA table_info(chatgpt_email_claim)").fetchall()
+        }
+        missing_columns = [
+            ("mail_account_id", "INTEGER"),
+            ("claim_token", "TEXT"),
+            ("status", "TEXT NOT NULL DEFAULT 'active'"),
+            ("claimed_at", "INTEGER NOT NULL DEFAULT 0"),
+            ("expires_at", "INTEGER NOT NULL DEFAULT 0"),
+            ("completed_at", "INTEGER NOT NULL DEFAULT 0"),
+        ]
+        for column, column_type in missing_columns:
+            if column not in columns:
+                conn.exec_driver_sql(
+                    f"ALTER TABLE chatgpt_email_claim ADD COLUMN {column} {column_type}"
+                )
+        conn.exec_driver_sql(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ix_chatgpt_email_claim_mail_account_id "
+            "ON chatgpt_email_claim(mail_account_id)"
+        )
+        conn.exec_driver_sql(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ix_chatgpt_email_claim_claim_token "
+            "ON chatgpt_email_claim(claim_token)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS ix_chatgpt_email_claim_expires_at "
+            "ON chatgpt_email_claim(expires_at)"
+        )
+
+
 ensure_mail_account_schema()
 ensure_token_refresh_log_schema()
 ensure_api_key_schema()
 ensure_proxy_schema()
+ensure_chatgpt_email_claim_schema()
 
 
 def ensure_mail_cache_schema() -> None:
@@ -329,6 +425,124 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Hotmail Mail Manager", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="templates")
+
+
+def _automation_http_error(exc: AutomationError) -> HTTPException:
+    return HTTPException(
+        status_code=exc.status_code,
+        detail={"code": exc.code, "message": exc.message},
+    )
+
+
+@app.post(
+    "/api/automation/chatgpt/claims",
+    dependencies=[Depends(require_automation_api_key)],
+)
+def claim_chatgpt_email(db: Session = Depends(get_db)):
+    try:
+        return claim_email(db)
+    except AutomationError as exc:
+        raise _automation_http_error(exc) from exc
+
+
+@app.post(
+    "/api/automation/chatgpt/verification-code",
+    dependencies=[Depends(require_automation_api_key)],
+)
+def get_chatgpt_verification_code(
+    body: ChatgptVerificationCodeBody,
+    db: Session = Depends(get_db),
+):
+    try:
+        claim, account = resolve_active_claim(db, body.claim_token)
+    except AutomationError as exc:
+        raise _automation_http_error(exc) from exc
+
+    folders = ("inbox", "junk")
+    caches = {folder: get_mail_cache(db, account.id, folder) for folder in folders}
+    cache_now = int(time.time())
+    tasks = {
+        folder: refresh_mail_cache_async(account.id, folder, limit=10)
+        for folder in folders
+        if not _automation_cache_is_recent(caches[folder], cache_now)
+    }
+    match = find_latest_chatgpt_code(
+        {folder: (cache or {}).get("items", []) for folder, cache in caches.items()},
+        account.email,
+        body.not_before,
+    )
+
+    if match is None and tasks:
+        deadline = time.monotonic() + 10
+        for task in tasks.values():
+            task.event.wait(timeout=max(0, deadline - time.monotonic()))
+        db.expire_all()
+        caches = {folder: get_mail_cache(db, account.id, folder) for folder in folders}
+        match = find_latest_chatgpt_code(
+            {folder: (cache or {}).get("items", []) for folder, cache in caches.items()},
+            account.email,
+            body.not_before,
+        )
+        unavailable_folders = [
+            folder
+            for folder in folders
+            if not caches[folder]
+            and folder in tasks
+            and tasks[folder].error
+        ]
+        if match is None and len(unavailable_folders) == len(folders):
+            raise HTTPException(status_code=502, detail={
+                "code": "mail_fetch_failed",
+                "message": "Unable to refresh mailbox",
+            })
+    try:
+        renew_claim(db, claim, code_found=bool(match))
+    except AutomationError as exc:
+        raise _automation_http_error(exc) from exc
+    return match or {"code": "", "received_at": "", "folder": ""}
+
+
+@app.post(
+    "/api/automation/chatgpt/claims/complete",
+    dependencies=[Depends(require_automation_api_key)],
+)
+def complete_chatgpt_claim(
+    body: ChatgptClaimTokenBody,
+    db: Session = Depends(get_db),
+):
+    try:
+        return complete_claim(db, body.claim_token)
+    except AutomationError as exc:
+        raise _automation_http_error(exc) from exc
+
+
+@app.post(
+    "/api/automation/chatgpt/claims/reconcile",
+    dependencies=[Depends(require_automation_api_key)],
+)
+def reconcile_chatgpt_claim(
+    body: ChatgptReconcileBody,
+    db: Session = Depends(get_db),
+):
+    try:
+        return reconcile_claim_registration(db, body.claim_token, body.email)
+    except AutomationError as exc:
+        raise _automation_http_error(exc) from exc
+
+
+@app.post(
+    "/api/automation/chatgpt/claims/release",
+    dependencies=[Depends(require_automation_api_key)],
+)
+def release_chatgpt_claim(
+    body: ChatgptClaimTokenBody,
+    db: Session = Depends(get_db),
+):
+    try:
+        released = release_claim(db, body.claim_token)
+    except AutomationError as exc:
+        raise _automation_http_error(exc) from exc
+    return {"ok": True, "released": released}
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -454,14 +668,17 @@ def preheat_accounts_async(account_ids: list[int], folder: str = "inbox", limit:
                 # 1) 先预热 OAuth token:忽略已缓存的,强制刷新一次,提前暴露 token 问题
                 try:
                     get_valid_access_token(account, db)
-                except OAuthServiceError as exc:
-                    logger.warning("账号 %s 预热 token 失败: %s", account.email, str(exc)[:200])
+                except OAuthServiceError:
+                    logger.warning(
+                        "账号 id=%s 预热 token 失败: error=oauth_token_failed",
+                        account_id,
+                    )
                     return False
                 # 2) 触发后台邮件缓存刷新(非阻塞,内部去重)
                 refresh_mail_cache_async(account_id, folder, limit=limit, force=False)
                 return True
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("账号 id=%s 预热失败: %s", account_id, str(exc)[:200])
+        except Exception:  # noqa: BLE001
+            logger.warning("账号 id=%s 预热失败: error=unexpected_error", account_id)
             return False
 
     def runner() -> None:
@@ -470,8 +687,8 @@ def preheat_accounts_async(account_ids: list[int], folder: str = "inbox", limit:
                 futures = [pool.submit(preheat_one, account_id) for account_id in account_ids]
                 for _ in as_completed(futures, timeout=120):
                     pass
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("预热账号池异常: %s", str(exc)[:200])
+        except Exception:  # noqa: BLE001
+            logger.warning("预热账号池异常: error=unexpected_error")
 
     threading.Thread(target=runner, name="preheat-accounts", daemon=True).start()
 
