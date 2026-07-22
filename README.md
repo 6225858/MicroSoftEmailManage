@@ -18,8 +18,6 @@
 
 ## 📸 项目预览
 
-### 登录界面
-<img src="./img/login.png" width="800" />
 
 ### 账号管理界面
 <img src="./img/manage.png" width="800" />
