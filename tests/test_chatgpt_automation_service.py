@@ -14,6 +14,7 @@ import chatgpt_automation_service as automation_service
 import icutool_mail
 import mail_cache_service
 import mail_service
+import oauth_service
 from oauth_service import OAuthServiceError
 from chatgpt_automation_service import (
     AutomationError,
@@ -320,6 +321,131 @@ class TagHelpersTest(unittest.TestCase):
 
 
 class SensitiveLogTest(unittest.TestCase):
+    oauth_log_tags = {
+        "all_endpoints_failed",
+        "fallback_to_msauth",
+        "http_error",
+        "missing_mail_read",
+        "network_retry",
+        "provider_error",
+        "refresh_attempt",
+        "refresh_failed",
+        "refresh_succeeded",
+        "token_rotated",
+    }
+
+    def assert_oauth_log_contract(self, records, account_id):
+        self.assertTrue(records, "expected at least one OAuth log record")
+        endpoint_pattern = "consumer|common|msauth|token_store|all"
+        tag_pattern = "|".join(sorted(self.oauth_log_tags))
+        for record in records:
+            message = record.getMessage()
+            self.assertRegex(
+                message,
+                rf"^oauth account_id={account_id} endpoint=({endpoint_pattern}) "
+                rf"attempt=\d+ tag=({tag_pattern})$",
+            )
+
+    def test_oauth_network_retry_log_uses_only_fixed_public_fields(self):
+        response = Mock()
+        provider_error = oauth_service.requests.exceptions.ConnectionError(
+            "private@example.com token=refresh-secret code=919020 password=hunter2"
+        )
+
+        with (
+            patch.object(oauth_service.requests, "post", side_effect=[provider_error, response]),
+            patch.object(oauth_service.time, "sleep"),
+            self.assertLogs(oauth_service.logger, level="INFO") as captured,
+        ):
+            try:
+                result = oauth_service._post_with_retry(
+                    oauth_service.TOKEN_URL_CONSUMER,
+                    data={},
+                    timeout=1,
+                    retries=1,
+                    account_id=17,
+                )
+            except TypeError as exc:
+                self.fail(f"OAuth retry helper must accept an account ID: {exc}")
+
+        self.assertIs(result, response)
+        self.assert_oauth_log_contract(captured.records, 17)
+        logged = " ".join(record.getMessage() for record in captured.records)
+        self.assertNotRegex(
+            logged,
+            r"private@example\.com|refresh-secret|919020|hunter2",
+        )
+
+    def test_standard_oauth_failure_logs_no_account_or_provider_secrets(self):
+        account = SimpleNamespace(
+            id=18,
+            email="standard-private@example.com",
+            refresh_token="standard-refresh-secret",
+            client_id="standard-client-secret",
+            password="shortpass",
+            cached_access_token="",
+            access_token_expire_time=0,
+        )
+        response = Mock(ok=False, status_code=400, text="response-body-secret")
+        response.json.return_value = {
+            "error": "invalid_grant",
+            "error_description": (
+                "standard-private@example.com token=standard-refresh-secret "
+                "code=818181 password=shortpass"
+            ),
+        }
+
+        with (
+            patch.object(oauth_service, "get_session_proxy", return_value=None),
+            patch.object(oauth_service, "_post_with_retry", return_value=response),
+            self.assertLogs(oauth_service.logger, level="DEBUG") as captured,
+            self.assertRaises(OAuthServiceError),
+        ):
+            oauth_service.get_valid_access_token(account, Mock())
+
+        self.assert_oauth_log_contract(captured.records, 18)
+        logged = " ".join(record.getMessage() for record in captured.records)
+        self.assertNotRegex(
+            logged,
+            r"standard-private@example\.com|standard-refresh-secret|standard-client-secret|"
+            r"response-body-secret|818181|shortpass|invalid_grant",
+        )
+
+    def test_msauth_failure_logs_no_account_or_provider_secrets(self):
+        account = SimpleNamespace(
+            id=19,
+            email="msauth-private@example.com",
+            refresh_token="M.C-msauth-refresh-secret",
+            client_id="msauth-client-secret",
+            password="tiny-pass",
+            cached_access_token="",
+            access_token_expire_time=0,
+        )
+        response = Mock(ok=False, status_code=401, text="msauth-response-secret")
+        response.json.return_value = {
+            "error": "access_denied",
+            "error_description": (
+                "msauth-private@example.com token=M.C-msauth-refresh-secret "
+                "code=717171 password=tiny-pass"
+            ),
+        }
+
+        with (
+            patch.object(oauth_service, "get_session_proxy", return_value=None),
+            patch.object(oauth_service, "_post_with_retry", return_value=response),
+            self.assertLogs(oauth_service.logger, level="DEBUG") as captured,
+            self.assertRaises(OAuthServiceError),
+        ):
+            oauth_service.get_valid_access_token(account, Mock())
+
+        self.assert_oauth_log_contract(captured.records, 19)
+        logged = " ".join(record.getMessage() for record in captured.records)
+        self.assertNotRegex(
+            logged,
+            r"msauth-private@example\.com|M\.C-msauth-refresh-secret|msauth-client-secret|"
+            r"msauth-response-secret|717171|tiny-pass|access_denied",
+        )
+
     def test_account_preheat_logs_neither_email_nor_oauth_error(self):
         account = SimpleNamespace(
             id=9,
