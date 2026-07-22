@@ -29,7 +29,7 @@ from mail_cache_service import (
     is_refreshing,
     cancel_refresh_for_account,
 )
-from models import ApiKey, MailAccount, MailCache, Proxy, TokenRefreshLog
+from models import ApiKey, ChatgptEmailClaim, MailAccount, MailCache, Proxy, TokenRefreshLog
 from oauth_service import OAuthServiceError, get_valid_access_token
 from proxy_service import import_proxy_line, test_proxies_status
 
@@ -291,10 +291,55 @@ def ensure_proxy_schema() -> None:
                     conn.exec_driver_sql(f"ALTER TABLE proxy ADD COLUMN {col} {coltype}")
 
 
+def ensure_chatgpt_email_claim_schema() -> None:
+    with engine.begin() as conn:
+        conn.exec_driver_sql("""
+            CREATE TABLE IF NOT EXISTS chatgpt_email_claim (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                mail_account_id INTEGER NOT NULL,
+                claim_token TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                claimed_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                completed_at INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+        columns = {
+            row[1]
+            for row in conn.exec_driver_sql("PRAGMA table_info(chatgpt_email_claim)").fetchall()
+        }
+        missing_columns = [
+            ("mail_account_id", "INTEGER"),
+            ("claim_token", "TEXT"),
+            ("status", "TEXT NOT NULL DEFAULT 'active'"),
+            ("claimed_at", "INTEGER NOT NULL DEFAULT 0"),
+            ("expires_at", "INTEGER NOT NULL DEFAULT 0"),
+            ("completed_at", "INTEGER NOT NULL DEFAULT 0"),
+        ]
+        for column, column_type in missing_columns:
+            if column not in columns:
+                conn.exec_driver_sql(
+                    f"ALTER TABLE chatgpt_email_claim ADD COLUMN {column} {column_type}"
+                )
+        conn.exec_driver_sql(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ix_chatgpt_email_claim_mail_account_id "
+            "ON chatgpt_email_claim(mail_account_id)"
+        )
+        conn.exec_driver_sql(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ix_chatgpt_email_claim_claim_token "
+            "ON chatgpt_email_claim(claim_token)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS ix_chatgpt_email_claim_expires_at "
+            "ON chatgpt_email_claim(expires_at)"
+        )
+
+
 ensure_mail_account_schema()
 ensure_token_refresh_log_schema()
 ensure_api_key_schema()
 ensure_proxy_schema()
+ensure_chatgpt_email_claim_schema()
 
 
 def ensure_mail_cache_schema() -> None:

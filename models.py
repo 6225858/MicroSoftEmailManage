@@ -29,6 +29,18 @@ class MailAccount(Base):
     created_at = Column(Integer, nullable=False)
 
 
+class ChatgptEmailClaim(Base):
+    __tablename__ = "chatgpt_email_claim"
+
+    id = Column(Integer, primary_key=True, index=True)
+    mail_account_id = Column(Integer, unique=True, index=True, nullable=False)
+    claim_token = Column(Text, unique=True, index=True, nullable=False)
+    status = Column(Text, default="active", nullable=False)
+    claimed_at = Column(Integer, nullable=False)
+    expires_at = Column(Integer, index=True, nullable=False)
+    completed_at = Column(Integer, default=0, nullable=False)
+
+
 class TokenRefreshLog(Base):
     __tablename__ = "token_refresh_log"
 
