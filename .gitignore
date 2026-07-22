@@ -2,6 +2,7 @@
 mail.db
 __pycache__
 .env*
+.worktrees/
 
 # 日志 / 临时文件
 *.log
