@@ -13,6 +13,7 @@ from chatgpt_automation_service import (
     append_exact_tag,
     claim_email,
     complete_claim,
+    find_latest_chatgpt_code,
     release_claim,
     renew_claim,
     resolve_active_claim,
@@ -248,3 +249,71 @@ class TagHelpersTest(unittest.TestCase):
             append_exact_tag(" vip，测试, vip ", "已注册chatgpt"),
             "vip,测试,已注册chatgpt",
         )
+
+
+def matching_mail(code="919020", received="2026-07-22 13:48:45"):
+    return {
+        "subject": "Your temporary ChatGPT verification code",
+        "mail_from": "ChatGPT (noreply@tm.openai.com)",
+        "mail_to": "user@outlook.com (user@outlook.com)",
+        "mail_dt": received,
+        "body": (
+            "<p>Enter this temporary verification code to continue:</p>"
+            f"<p>{code}</p>"
+            "<a href='https://u20216706.ct.sendgrid.net/123456789'>ChatGPT</a>"
+        ),
+    }
+
+
+class VerificationMatcherTest(unittest.TestCase):
+    not_before_ms = 1784699250000
+
+    def test_extracts_only_anchored_six_digit_code(self):
+        result = find_latest_chatgpt_code(
+            {"inbox": [matching_mail()], "junk": []},
+            "user@outlook.com",
+            self.not_before_ms,
+        )
+        self.assertEqual(result["code"], "919020")
+        self.assertEqual(result["folder"], "inbox")
+        self.assertEqual(result["received_at"], "2026-07-22T13:48:45+08:00")
+
+    def test_rejects_wrong_sender_subject_recipient_stale_and_non_six_digit(self):
+        variants = []
+        for field, value in [
+            ("mail_from", "attacker@example.com"),
+            ("subject", "Your verification code"),
+            ("mail_to", "other@outlook.com"),
+            ("mail_dt", "2026-07-22 12:00:00"),
+            ("body", "Enter this temporary verification code to continue: 12345"),
+        ]:
+            item = matching_mail()
+            item[field] = value
+            variants.append(item)
+        for item in variants:
+            with self.subTest(item=item):
+                self.assertIsNone(find_latest_chatgpt_code(
+                    {"inbox": [item]}, "user@outlook.com", self.not_before_ms
+                ))
+
+    def test_latest_matching_mail_wins_across_folders(self):
+        result = find_latest_chatgpt_code(
+            {
+                "inbox": [matching_mail(code="111111", received="2026-07-22 13:47:45")],
+                "junk": [matching_mail(code="222222", received="2026-07-22 13:48:45")],
+            },
+            "user@outlook.com",
+            self.not_before_ms,
+        )
+        self.assertEqual(result, {
+            "code": "222222",
+            "received_at": "2026-07-22T13:48:45+08:00",
+            "folder": "junk",
+        })
+
+    def test_ignores_six_digit_sendgrid_url_without_fixed_sentence(self):
+        item = matching_mail()
+        item["body"] = "<a href='https://u20216706.ct.sendgrid.net/123456789'>ChatGPT</a>"
+        self.assertIsNone(find_latest_chatgpt_code(
+            {"inbox": [item]}, "user@outlook.com", self.not_before_ms
+        ))

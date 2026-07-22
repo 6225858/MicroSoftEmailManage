@@ -32,6 +32,15 @@ from mail_cache_service import (
 from models import ApiKey, ChatgptEmailClaim, MailAccount, MailCache, Proxy, TokenRefreshLog
 from oauth_service import OAuthServiceError, get_valid_access_token
 from proxy_service import import_proxy_line, test_proxies_status
+from chatgpt_automation_service import (
+    AutomationError,
+    claim_email,
+    complete_claim,
+    find_latest_chatgpt_code,
+    release_claim,
+    renew_claim,
+    resolve_active_claim,
+)
 
 logger = logging.getLogger("icutool_mail")
 
@@ -176,6 +185,14 @@ class ApiKeyBody(BaseModel):
     name: str
 
 
+class ChatgptClaimTokenBody(BaseModel):
+    claim_token: str
+
+
+class ChatgptVerificationCodeBody(ChatgptClaimTokenBody):
+    not_before: int
+
+
 def get_db():
     db = SessionLocal()
     try:
@@ -196,6 +213,22 @@ def require_api_key(
             db.commit()
             return
         raise HTTPException(status_code=401, detail="invalid api key")
+
+
+def require_automation_api_key(
+    x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key"),
+    db: Session = Depends(get_db),
+):
+    value = (x_api_key or "").strip()
+    record = db.query(ApiKey).filter(ApiKey.key == value).first() if value else None
+    if record is None:
+        raise HTTPException(status_code=401, detail={
+            "code": "invalid_api_key",
+            "message": "API Key missing or invalid",
+        })
+    record.last_used_at = int(time.time())
+    db.commit()
+    return record
 
 
 def normalize_tags(tags: str) -> str:
@@ -374,6 +407,99 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Hotmail Mail Manager", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="templates")
+
+
+def _automation_http_error(exc: AutomationError) -> HTTPException:
+    return HTTPException(
+        status_code=exc.status_code,
+        detail={"code": exc.code, "message": exc.message},
+    )
+
+
+@app.post(
+    "/api/automation/chatgpt/claims",
+    dependencies=[Depends(require_automation_api_key)],
+)
+def claim_chatgpt_email(db: Session = Depends(get_db)):
+    try:
+        return claim_email(db)
+    except AutomationError as exc:
+        raise _automation_http_error(exc) from exc
+
+
+@app.post(
+    "/api/automation/chatgpt/verification-code",
+    dependencies=[Depends(require_automation_api_key)],
+)
+def get_chatgpt_verification_code(
+    body: ChatgptVerificationCodeBody,
+    db: Session = Depends(get_db),
+):
+    try:
+        claim, account = resolve_active_claim(db, body.claim_token)
+    except AutomationError as exc:
+        raise _automation_http_error(exc) from exc
+
+    folders = ("inbox", "junk")
+    tasks = {
+        folder: refresh_mail_cache_async(account.id, folder, limit=10)
+        for folder in folders
+    }
+    caches = {folder: get_mail_cache(db, account.id, folder) for folder in folders}
+    has_cached_items = any(cache and cache.get("items") for cache in caches.values())
+
+    if not has_cached_items:
+        deadline = time.monotonic() + 10
+        for task in tasks.values():
+            task.event.wait(timeout=max(0, deadline - time.monotonic()))
+        db.expire_all()
+        caches = {folder: get_mail_cache(db, account.id, folder) for folder in folders}
+        has_cached_items = any(cache and cache.get("items") for cache in caches.values())
+        if not has_cached_items and all(task.error for task in tasks.values()):
+            raise HTTPException(status_code=502, detail={
+                "code": "mail_fetch_failed",
+                "message": "Unable to refresh mailbox",
+            })
+
+    match = find_latest_chatgpt_code(
+        {folder: (cache or {}).get("items", []) for folder, cache in caches.items()},
+        account.email,
+        body.not_before,
+    )
+    try:
+        renew_claim(db, claim, code_found=bool(match))
+    except AutomationError as exc:
+        raise _automation_http_error(exc) from exc
+    return match or {"code": "", "received_at": "", "folder": ""}
+
+
+@app.post(
+    "/api/automation/chatgpt/claims/complete",
+    dependencies=[Depends(require_automation_api_key)],
+)
+def complete_chatgpt_claim(
+    body: ChatgptClaimTokenBody,
+    db: Session = Depends(get_db),
+):
+    try:
+        return complete_claim(db, body.claim_token)
+    except AutomationError as exc:
+        raise _automation_http_error(exc) from exc
+
+
+@app.post(
+    "/api/automation/chatgpt/claims/release",
+    dependencies=[Depends(require_automation_api_key)],
+)
+def release_chatgpt_claim(
+    body: ChatgptClaimTokenBody,
+    db: Session = Depends(get_db),
+):
+    try:
+        released = release_claim(db, body.claim_token)
+    except AutomationError as exc:
+        raise _automation_http_error(exc) from exc
+    return {"ok": True, "released": released}
 
 
 @app.get("/", response_class=HTMLResponse)

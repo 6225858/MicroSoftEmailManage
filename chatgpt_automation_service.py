@@ -1,6 +1,10 @@
 import secrets
 import time
 from collections.abc import Callable
+from datetime import datetime, timedelta, timezone
+from html import unescape
+from html.parser import HTMLParser
+import re
 
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
@@ -13,6 +17,103 @@ ACTIVE_LEASE_SECONDS = 15 * 60
 CODE_FOUND_LEASE_SECONDS = 24 * 60 * 60
 COMPLETED_RECEIPT_SECONDS = 24 * 60 * 60
 REGISTERED_TAG = "已注册chatgpt"
+EXPECTED_SENDER = "noreply@tm.openai.com"
+EXPECTED_SUBJECT = "Your temporary ChatGPT verification code"
+BODY_CODE_RE = re.compile(
+    r"Enter\s+this\s+temporary\s+verification\s+code\s+to\s+continue:\s*(?<!\d)(\d{6})(?!\d)",
+    re.IGNORECASE,
+)
+EMAIL_RE = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.IGNORECASE)
+SHANGHAI_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
+
+
+class _VisibleTextParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self._ignored_depth = 0
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        if tag.lower() in {"script", "style"}:
+            self._ignored_depth += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() in {"script", "style"} and self._ignored_depth:
+            self._ignored_depth -= 1
+
+    def handle_data(self, data: str) -> None:
+        if not self._ignored_depth:
+            self.parts.append(data)
+
+
+def _visible_text(value: str) -> str:
+    parser = _VisibleTextParser()
+    parser.feed(str(value or ""))
+    parser.close()
+    return " ".join(unescape(" ".join(parser.parts)).split())
+
+
+def extract_chatgpt_code(body: str) -> str:
+    match = BODY_CODE_RE.search(_visible_text(body))
+    return match.group(1) if match else ""
+
+
+def _parse_received_datetime(value) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    try:
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", value):
+            return datetime.strptime(value, "%Y-%m-%d %H:%M:%S").replace(tzinfo=SHANGHAI_TZ)
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed
+
+
+def _addresses(value) -> set[str]:
+    return {match.group(0).casefold() for match in EMAIL_RE.finditer(str(value or ""))}
+
+
+def find_latest_chatgpt_code(
+    folder_mails: dict[str, list[dict]], email: str, not_before_ms: int
+) -> dict | None:
+    try:
+        earliest_ms = int(not_before_ms) - 120000
+    except (TypeError, ValueError):
+        return None
+
+    expected_recipient = str(email or "").strip().casefold()
+    if not expected_recipient:
+        return None
+
+    latest: tuple[datetime, str, str] | None = None
+    for folder, mails in folder_mails.items():
+        for mail in mails or []:
+            if not isinstance(mail, dict):
+                continue
+            if _addresses(mail.get("mail_from")) != {EXPECTED_SENDER}:
+                continue
+            if str(mail.get("subject") or "").strip().casefold() != EXPECTED_SUBJECT.casefold():
+                continue
+            if expected_recipient not in _addresses(mail.get("mail_to")):
+                continue
+            received_at = _parse_received_datetime(mail.get("mail_dt"))
+            if received_at is None or int(received_at.timestamp() * 1000) < earliest_ms:
+                continue
+            code = extract_chatgpt_code(str(mail.get("body") or ""))
+            if not code:
+                continue
+            candidate = (received_at, str(folder), code)
+            if latest is None or candidate[0] > latest[0]:
+                latest = candidate
+
+    if latest is None:
+        return None
+    received_at, folder, code = latest
+    return {"code": code, "received_at": received_at.isoformat(), "folder": folder}
 
 
 class AutomationError(Exception):
