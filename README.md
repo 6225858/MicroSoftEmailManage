@@ -319,10 +319,9 @@ MSAuth 端点（login.live.com）
 
 ---
 
-## 📄 License
+## 📄 二改自：
 
-MIT License
-
+icutool/MicroSoftEmailManage
 ---
 
 ## 💬 说明
