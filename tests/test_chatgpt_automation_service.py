@@ -317,3 +317,40 @@ class VerificationMatcherTest(unittest.TestCase):
         self.assertIsNone(find_latest_chatgpt_code(
             {"inbox": [item]}, "user@outlook.com", self.not_before_ms
         ))
+
+    def test_uses_parenthesized_actual_recipient_not_email_like_display_name(self):
+        item = matching_mail()
+        item["mail_to"] = "user@outlook.com (attacker@example.com)"
+
+        self.assertIsNone(find_latest_chatgpt_code(
+            {"inbox": [item]}, "user@outlook.com", self.not_before_ms
+        ))
+
+    def test_accepts_project_normalized_and_plain_recipient_addresses(self):
+        for mail_to in [
+            "user@outlook.com (user@outlook.com)",
+            "user@outlook.com",
+            "User <user@outlook.com>",
+        ]:
+            with self.subTest(mail_to=mail_to):
+                item = matching_mail()
+                item["mail_to"] = mail_to
+                result = find_latest_chatgpt_code(
+                    {"inbox": [item]}, "user@outlook.com", self.not_before_ms
+                )
+                self.assertEqual(result["code"], "919020")
+
+    def test_uses_actual_sender_for_project_and_rfc_address_forms(self):
+        for mail_from, should_match in [
+            ("noreply@tm.openai.com (attacker@example.com)", False),
+            ("ChatGPT (noreply@tm.openai.com)", True),
+            ("noreply@tm.openai.com", True),
+            ("ChatGPT <noreply@tm.openai.com>", True),
+        ]:
+            with self.subTest(mail_from=mail_from):
+                item = matching_mail()
+                item["mail_from"] = mail_from
+                result = find_latest_chatgpt_code(
+                    {"inbox": [item]}, "user@outlook.com", self.not_before_ms
+                )
+                self.assertEqual(result is not None, should_match)

@@ -2,6 +2,7 @@ import secrets
 import time
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
+from email.utils import getaddresses
 from html import unescape
 from html.parser import HTMLParser
 import re
@@ -24,6 +25,10 @@ BODY_CODE_RE = re.compile(
     re.IGNORECASE,
 )
 EMAIL_RE = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.IGNORECASE)
+PROJECT_ACTUAL_ADDRESS_RE = re.compile(
+    rf"(?P<separator>^|,)\s*[^()]*\(\s*(?P<address>{EMAIL_RE.pattern})\s*\)\s*(?=,|$)",
+    re.IGNORECASE,
+)
 SHANGHAI_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
 
 
@@ -74,7 +79,15 @@ def _parse_received_datetime(value) -> datetime | None:
 
 
 def _addresses(value) -> set[str]:
-    return {match.group(0).casefold() for match in EMAIL_RE.finditer(str(value or ""))}
+    normalized = PROJECT_ACTUAL_ADDRESS_RE.sub(
+        lambda match: f"{match.group('separator')} <{match.group('address')}>",
+        str(value or ""),
+    )
+    return {
+        address.strip().casefold()
+        for _display_name, address in getaddresses([normalized])
+        if EMAIL_RE.fullmatch(address.strip())
+    }
 
 
 def find_latest_chatgpt_code(
