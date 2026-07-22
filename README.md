@@ -227,6 +227,31 @@ http://IP:10019
 
 ## 安全说明
 
+## ChatGPT 邮箱自动化
+
+此服务可向受信任的浏览器扩展提供一次性的 ChatGPT 注册邮箱与验证码。打开后台的 **API 管理**，输入名称并创建 API Key；将生成的 Key 只保存到受信任的客户端。自动化接口不接受空 Key，也不接受无效 Key：每一个自动化请求都必须带有有效、非空的请求头：
+
+```text
+X-Api-Key: <在 API 管理页面创建的 Key>
+```
+
+服务默认可由插件配置为 `http://192.168.1.27:10019/`，也可改为任意可达的 HTTP 或 HTTPS 服务根地址。LAN 部署时必须在防火墙、反向代理或网络 ACL 中将端口 `10019` 限制为可信客户端访问，不能暴露给不受信任的网络。
+
+### API contract
+
+```text
+POST /api/automation/chatgpt/claims
+POST /api/automation/chatgpt/verification-code
+POST /api/automation/chatgpt/claims/complete
+POST /api/automation/chatgpt/claims/release
+```
+
+`claims` 自动领取一个邮箱。候选邮箱必须没有**精确**标签 `已注册chatgpt`；包含相似文字的标签不等同于该标签。成功领取的租约为 15 分钟。使用 `verification-code` 查询验证码时须提交领取 token 和本次登录的 `not_before` 时间；服务只检查 `Inbox` 与 `Junk`，并从符合条件的邮件中选择最新一封。
+
+验证码匹配是严格的：发件人必须为 `noreply@tm.openai.com`，标题必须精确为 `Your temporary ChatGPT verification code`，收件人必须是本次领取的邮箱，正文可见文本中必须在固定锚点 `Enter this temporary verification code to continue:` 之后取第一个独立的六位数字。找到验证码后，领取租约会延长为 24 小时。
+
+注册成功后调用 `claims/complete`。服务会给邮箱附加精确标签 `已注册chatgpt`，并保留完成回执 24 小时，使重复完成调用保持幂等。尚未成功时调用 `claims/release` 释放领取，供其他任务重新领取；已经完成的领取不能释放。客户端遇到网络故障或服务端 5xx 时应保留 pending completion 并重试完成回执；收到 401 时应修复 API Key 后再重试，而不是释放已完成但未回执的领取。
+
 当前项目定位为本地管理工具或受信任环境下的内部工具，登录机制较轻量：
 
 - 默认无登录密码，访问根路径即可进入后台
