@@ -55,8 +55,8 @@ DETAIL_SELECT = "id,subject,from,toRecipients,ccRecipients,bccRecipients,replyTo
 
 # 请求超时（秒）
 GRAPH_TIMEOUT = 30
-IMAP_TIMEOUT = 15
-POP3_TIMEOUT = 15
+IMAP_TIMEOUT = 10
+POP3_TIMEOUT = 10
 
 
 class MailServiceError(Exception):
@@ -476,6 +476,17 @@ def _load_with_protocol_selection(
                 "邮箱 account=%s 跳过 %s 协议（缺少凭据）",
                 _account_log_id(account), protocol.upper(),
             )
+            continue
+
+        # 优化：如果 IMAP 连接超时，跳过 POP3
+        # IMAP 和 POP3 连接同一个服务器 outlook.office365.com，
+        # IMAP 超时说明 IP 被限制，POP3 也会超时，跳过可节省 10 秒
+        if protocol == "pop3" and errors and "timed out" in errors[-1].lower():
+            logger.info(
+                "邮箱 account=%s IMAP 连接超时，跳过 POP3（同一服务器也会超时）",
+                _account_log_id(account),
+            )
+            errors.append("POP3: 跳过（IMAP 连接超时，同一服务器也会超时）")
             continue
 
         tried.append(protocol)
