@@ -869,13 +869,27 @@ def import_accounts(body: ImportBody, db: Session = Depends(get_db)):
 
 
 @app.get("/api/accounts/export", dependencies=[Depends(require_api_key)])
-def export_accounts(db: Session = Depends(get_db)):
-    accounts = (
-        db.query(MailAccount)
-        .filter(MailAccount.valid_status != 0)
-        .order_by(MailAccount.id.asc())
-        .all()
-    )
+def export_accounts(
+    ids: str | None = Query(None, description="逗号分隔的账号ID列表"),
+    tag: str | None = Query(None, description="按标签筛选"),
+    db: Session = Depends(get_db),
+):
+    query = db.query(MailAccount).filter(MailAccount.valid_status != 0)
+
+    # 优先按选中的 ID 导出
+    if ids:
+        id_list = []
+        for part in ids.split(","):
+            part = part.strip()
+            if part.isdigit():
+                id_list.append(int(part))
+        if id_list:
+            query = query.filter(MailAccount.id.in_(id_list))
+    elif tag:
+        # 按标签筛选（tags 字段是逗号分隔的字符串）
+        query = query.filter(MailAccount.tags.contains(tag))
+
+    accounts = query.order_by(MailAccount.id.asc()).all()
     lines = []
     for account in accounts:
         parts = [

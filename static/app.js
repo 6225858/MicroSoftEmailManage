@@ -1914,11 +1914,28 @@ async function handleImportDrop(event) {
 }
 
 async function exportAccounts() {
-    setMessage(elements.accountMessage, text.exportingAccounts, false);
+    // 构建导出参数：优先选中的账号，其次标签筛选，最后全部
+    const params = new URLSearchParams();
+    let exportDesc = "全部账号";
+    if (state.selectedAccountIds.size > 0) {
+        params.set("ids", Array.from(state.selectedAccountIds).join(","));
+        exportDesc = `选中的 ${state.selectedAccountIds.size} 个账号`;
+    } else {
+        const selectedTag = elements.tagFilter.value;
+        if (selectedTag) {
+            params.set("tag", selectedTag);
+            exportDesc = `标签「${selectedTag}」下的账号`;
+        }
+    }
+
+    setMessage(elements.accountMessage, `正在导出${exportDesc}...`, false);
     elements.exportAccountsBtn.disabled = true;
 
     try {
-        const response = await fetch("/api/accounts/export");
+        const queryString = params.toString();
+        const url = "/api/accounts/export" + (queryString ? `?${queryString}` : "");
+
+        const response = await fetch(url);
 
         if (!response.ok) {
             const data = await response.json().catch(() => ({}));
@@ -1935,7 +1952,7 @@ async function exportAccounts() {
         anchor.remove();
         URL.revokeObjectURL(downloadUrl);
 
-        setMessage(elements.accountMessage, text.exportAccountsSuccess, false);
+        setMessage(elements.accountMessage, `${exportDesc}导出成功，文件已开始下载`, false);
     } catch (error) {
         setMessage(elements.accountMessage, error.message || text.requestFailed, true);
     } finally {
