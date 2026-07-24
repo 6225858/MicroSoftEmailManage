@@ -46,7 +46,7 @@ from chatgpt_automation_service import (
 logger = logging.getLogger("icutool_mail")
 
 # ── 应用版本 & 配置 ──────────────────────────────────────
-APP_VERSION = "1.1.3"
+APP_VERSION = "1.1.4"
 DEFAULT_GITHUB_REPO = "6225858/MicroSoftEmailManage"
 SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
 
