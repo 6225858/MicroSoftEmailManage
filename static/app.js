@@ -1923,8 +1923,14 @@ async function exportAccounts() {
     } else {
         const selectedTag = elements.tagFilter.value;
         if (selectedTag) {
-            params.set("tag", selectedTag);
-            exportDesc = `标签「${selectedTag}」下的账号`;
+            if (selectedTag === NO_TAG_FILTER_VALUE) {
+                // 特殊值：无标签
+                params.set("tag", "__NO_TAG__");
+                exportDesc = "无标签的账号";
+            } else {
+                params.set("tag", selectedTag);
+                exportDesc = `标签「${selectedTag}」下的账号`;
+            }
         }
     }
 
