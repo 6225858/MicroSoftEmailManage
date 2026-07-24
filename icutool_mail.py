@@ -886,8 +886,17 @@ def export_accounts(
         if id_list:
             query = query.filter(MailAccount.id.in_(id_list))
     elif tag:
-        # 按标签筛选（tags 字段是逗号分隔的字符串）
-        query = query.filter(MailAccount.tags.contains(tag))
+        # 按标签精确匹配（tags 字段是逗号分隔的字符串）
+        # 不能用 contains/like 做子串匹配，否则 "vip" 会匹配 "svip"、"vip2" 等
+        # 必须匹配完整的逗号分隔元素：tag / tag,... / ...,tag / ...,tag,...
+        query = query.filter(
+            or_(
+                MailAccount.tags == tag,
+                MailAccount.tags.like(f"{tag},%"),
+                MailAccount.tags.like(f"%,{tag}"),
+                MailAccount.tags.like(f"%,{tag},%"),
+            )
+        )
 
     accounts = query.order_by(MailAccount.id.asc()).all()
     lines = []
