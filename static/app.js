@@ -2381,9 +2381,26 @@ elements.tagModalSuggestions.addEventListener("click", (event) => {
     applyQuickTag(button.dataset.tag);
 });
 elements.tagModalSaveBtn.addEventListener("click", saveTagModalTags);
-elements.searchInput.addEventListener("input", renderAccounts);
+elements.searchInput.addEventListener("input", () => {
+    // 切换搜索筛选时清除之前的选中
+    state.selectedAccountIds.clear();
+    if (elements.accountsBulkSelectAll) {
+        elements.accountsBulkSelectAll.checked = false;
+        elements.accountsBulkSelectAll.indeterminate = false;
+    }
+    renderAccounts();
+});
 elements.mailSearchInput.addEventListener("input", renderAccounts);
-elements.tagFilter.addEventListener("change", renderAccounts);
+elements.mailSearchInput.addEventListener("input", renderAccounts);
+elements.tagFilter.addEventListener("change", () => {
+    // 切换标签筛选时清除之前的选中，避免旧选中残留导致导出数量多于预期
+    state.selectedAccountIds.clear();
+    if (elements.accountsBulkSelectAll) {
+        elements.accountsBulkSelectAll.checked = false;
+        elements.accountsBulkSelectAll.indeterminate = false;
+    }
+    renderAccounts();
+});
 elements.mailTagFilter.addEventListener("change", renderAccounts);
 
 // ─── 批量删除 / 单条删除 事件绑定 ───────────────────
