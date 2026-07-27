@@ -756,6 +756,48 @@ time,
     border: 1px solid var(--border);
 }
 
+/* 账号卡片上可双击移除的标签 */
+.tag[data-tag] {
+    cursor: pointer;
+    transition: background-color 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}
+
+.tag[data-tag]:hover {
+    background: var(--danger-soft, #fdecec);
+    color: var(--danger, #e5484d);
+    border-color: var(--danger, #e5484d);
+    text-decoration: line-through;
+}
+
+.proxy-warning-banner {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 14px;
+    background: var(--warning-soft, #fff4e5);
+    color: var(--warning-text, #8a5a00);
+    border-bottom: 1px solid var(--warning-border, #ffd591);
+    font-size: 13px;
+    line-height: 1.5;
+    position: sticky;
+    top: 0;
+    z-index: 50;
+}
+.proxy-warning-banner__icon { font-size: 16px; flex: 0 0 auto; }
+.proxy-warning-banner__text { flex: 1 1 auto; }
+.proxy-warning-banner__close {
+    flex: 0 0 auto;
+    border: none;
+    background: transparent;
+    color: inherit;
+    font-size: 18px;
+    line-height: 1;
+    cursor: pointer;
+    padding: 2px 6px;
+    border-radius: 4px;
+}
+.proxy-warning-banner__close:hover { background: rgba(0, 0, 0, 0.06); }
+
 .account-list,
 .mail-list {
     display: flex;

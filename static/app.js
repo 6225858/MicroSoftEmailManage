@@ -342,6 +342,7 @@ const text = {
     mailsTitle: "邮件查看",
     noMatchingAccounts: "暂无符合条件的邮箱账号",
     noTags: "暂无标签",
+    dblclickToRemoveTag: "双击移除该标签",
     accountCount: (count) => `${count} 个账号`,
     visibleAccountCount: (visible, total) => `当前显示 ${visible} / 总计 ${total} 个邮箱`,
     chooseMailList: "请选择一个邮箱账号后查看邮件",
@@ -469,6 +470,35 @@ async function api(path, options = {}) {
     }
 }
 
+// ─── 部署连通性自检：无代理且直连不通时提示配置代理 ─────────
+async function checkDeploymentConnectivity() {
+    try {
+        const data = await api("GET", "/api/connectivity");
+        if (data && data.need_proxy) {
+            showProxyWarningBanner();
+        }
+    } catch (e) {
+        // 自检失败不影响主流程
+    }
+}
+
+function showProxyWarningBanner() {
+    if (document.getElementById("proxy-warning-banner")) return;
+    const banner = document.createElement("div");
+    banner.id = "proxy-warning-banner";
+    banner.className = "proxy-warning-banner";
+    banner.innerHTML =
+        '<span class="proxy-warning-banner__icon">⚠️</span>' +
+        '<span class="proxy-warning-banner__text">检测到未配置代理且无法直连 Microsoft 服务（大陆网络常见于直连失败），账号可能无法刷新新邮件。请到「设置 → 代理」配置代理后重试。</span>' +
+        '<button type="button" class="proxy-warning-banner__close" aria-label="关闭">×</button>';
+    banner.querySelector(".proxy-warning-banner__close").addEventListener("click", () => {
+        banner.remove();
+    });
+    document.body.insertBefore(banner, document.body.firstChild);
+}
+
+window.addEventListener("load", checkDeploymentConnectivity);
+
 function escapeHtml(value) {
     const div = document.createElement("div");
     div.textContent = value ?? "";
@@ -564,13 +594,18 @@ function normalizeTags(value) {
     return parseTags(value).join(", ");
 }
 
-function renderTagMarkup(value, emptyText = text.noTags, className = "tag") {
+function renderTagMarkup(value, emptyText = text.noTags, className = "tag", interactive = false) {
     const tags = parseTags(value);
     if (!tags.length) {
         return `<span class="muted">${escapeHtml(emptyText)}</span>`;
     }
 
-    return tags.map((tag) => `<span class="${className}">${escapeHtml(tag)}</span>`).join("");
+    return tags.map((tag) => {
+        const attr = interactive
+            ? ` data-tag="${escapeHtml(tag)}" title="${escapeHtml(text.dblclickToRemoveTag)}"`
+            : "";
+        return `<span class="${className}"${attr}>${escapeHtml(tag)}</span>`;
+    }).join("");
 }
 
 function renderRemarkMarkup(value, emptyText = EMPTY_REMARK_TEXT, className = "remark-content") {
@@ -839,7 +874,7 @@ function renderAccountButtons(container, accounts, options) {
     }
 
     container.innerHTML = accounts.map((account) => {
-        const tags = renderTagMarkup(account.tags);
+        const tags = renderTagMarkup(account.tags, text.noTags, "tag", true);
         const activeClass = account.id === state.selectedAccountId ? " account-item-active" : "";
         const checked = state.selectedAccountIds.has(account.id) ? " checked" : "";
         const checkbox = `
@@ -2016,7 +2051,23 @@ async function persistTags(accountId, tags) {
     return data;
 }
 
-async function persistRemark(accountId, remark) {
+// 双击标签移除：从账号的标签集合中删掉指定标签并持久化
+async function removeTagFromAccount(accountId, tag) {
+    const account = state.accounts.find((item) => item.id === accountId);
+    if (!account) {
+        return;
+    }
+
+    const nextTags = parseTags(account.tags)
+        .filter((item) => item !== tag)
+        .join(", ");
+
+    try {
+        await persistTags(accountId, nextTags);
+    } catch (error) {
+        setMessage(elements.accountMessage, error.message, true);
+    }
+}
     const data = await api(`/api/accounts/${accountId}/remark`, {
         method: "POST",
         body: JSON.stringify({ remark })
@@ -2381,6 +2432,22 @@ elements.tagModalSuggestions.addEventListener("click", (event) => {
     applyQuickTag(button.dataset.tag);
 });
 elements.tagModalSaveBtn.addEventListener("click", saveTagModalTags);
+// 双击账号卡片上的标签即可移除该标签（弹窗内的预览/当前标签不含 account 上下文，不触发）
+document.addEventListener("dblclick", (event) => {
+    const tagSpan = event.target.closest(".tag[data-tag]");
+    if (!tagSpan) {
+        return;
+    }
+    const shell = tagSpan.closest(".account-item-shell");
+    if (!shell) {
+        return;
+    }
+    const idEl = shell.querySelector("[data-id]");
+    if (!idEl) {
+        return;
+    }
+    removeTagFromAccount(Number(idEl.dataset.id), tagSpan.dataset.tag);
+});
 elements.searchInput.addEventListener("input", () => {
     // 切换搜索筛选时清除之前的选中
     state.selectedAccountIds.clear();

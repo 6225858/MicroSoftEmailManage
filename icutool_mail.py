@@ -416,6 +416,18 @@ ensure_mail_cache_schema()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     start_token_refresh_scheduler()
+    # 部署连通性自检：大陆网络无代理时直连 Microsoft 会失败，提前告警
+    try:
+        from proxy_service import has_available_proxy, test_direct_connectivity
+        with SessionLocal() as db:
+            if not has_available_proxy(db):
+                if not test_direct_connectivity():
+                    logger.warning(
+                        "⚠️ 未配置代理且直连 Microsoft 服务失败：大陆网络可能无法直连，"
+                        "请到「设置-代理」配置代理，否则账号可能无法刷新新邮件。"
+                    )
+    except Exception:  # noqa: BLE001
+        logger.exception("启动连通性自检异常")
     try:
         yield
     finally:
@@ -1451,6 +1463,20 @@ def check_all_proxies(db: Session = Depends(get_db)):
     available = db.query(Proxy).filter(Proxy.status == 1).count()
     total = db.query(Proxy).count()
     return {"available": available, "total": total}
+
+
+@app.get("/api/connectivity")
+def connectivity_check(db: Session = Depends(get_db)):
+    """部署连通性自检（免鉴权）：返回是否配置了代理、直连 Microsoft 是否可达。"""
+    from proxy_service import has_available_proxy, test_direct_connectivity
+
+    proxy = has_available_proxy(db)
+    direct_ok = True if proxy else test_direct_connectivity()
+    return {
+        "proxy_configured": proxy,
+        "direct_ok": direct_ok,
+        "need_proxy": (not proxy and not direct_ok),
+    }
 
 
 @app.get("/health")

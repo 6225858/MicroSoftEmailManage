@@ -29,6 +29,9 @@ _refresh_lock = threading.Lock()
 # 避免 is_refreshing 永远为 True 导致前端一直显示"正在拉取最新邮件"。
 REFRESH_WATCHDOG_SECONDS = 90
 
+# 未配置任何可用代理时，刷新失败附加的明确提示（大陆网络直连 Microsoft 通常不通）
+NO_PROXY_REFRESH_HINT = "（当前未配置任何可用代理，大陆网络可能无法直连 Microsoft 服务，请到「设置-代理」配置代理后重试）"
+
 
 class RefreshTask:
     """表示一次后台刷新任务，可被等待。"""
@@ -205,8 +208,11 @@ def refresh_mail_cache_async(
     def worker() -> None:
         error_msg: Optional[str] = None
         item_count = -1
+        no_proxy = False
         try:
             with SessionLocal() as db:
+                from proxy_service import has_available_proxy
+                no_proxy = not has_available_proxy(db)
                 account = db.query(MailAccount).filter(MailAccount.id == account_id).first()
                 if not account:
                     error_msg = "account not found"
@@ -226,6 +232,8 @@ def refresh_mail_cache_async(
                         )
         except MailServiceError as exc:
             error_msg = safe_mail_error_tag(exc)
+            if no_proxy:
+                error_msg += NO_PROXY_REFRESH_HINT
             logger.warning(
                 "后台刷新邮件缓存失败 account=%d folder=%s error=%s",
                 account_id, folder, error_msg,
@@ -234,6 +242,8 @@ def refresh_mail_cache_async(
             # 记录完整堆栈，便于定位真正的失败原因；错误文案带上异常类型与信息，
             # 不再是无意义的 "unexpected_error"，方便前端展示与排查。
             error_msg = f"unexpected_error: {type(exc).__name__}: {str(exc)[:200]}"
+            if no_proxy:
+                error_msg += NO_PROXY_REFRESH_HINT
             logger.exception(
                 "后台刷新邮件缓存异常 account=%d folder=%s",
                 account_id, folder,

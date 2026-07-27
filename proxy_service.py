@@ -341,6 +341,32 @@ def get_session_proxy(db: Session, account=None) -> dict | None:
     return {"http": url, "https": url}
 
 
+def has_available_proxy(db: Session) -> bool:
+    """只读判断是否存在 status==1 的可用代理，不产生轮询副作用。"""
+    from models import Proxy
+
+    return db.query(Proxy).filter(Proxy.status == 1).first() is not None
+
+
+def test_direct_connectivity(timeout: int = 8) -> bool:
+    """直连探测 Microsoft 端点，判断当前网络能否不通代理访问。
+
+    用于部署连通性自检：大陆网络下直连通常会失败。
+    返回 True 表示网络可达（即便收到 401/405 也视为可达），False 表示直连失败。
+    """
+    probe_urls = [
+        "https://graph.microsoft.com/v1.0/me",
+        "https://login.microsoftonline.com/",
+    ]
+    for url in probe_urls:
+        try:
+            requests.get(url, timeout=timeout)
+            return True
+        except requests.RequestException:
+            continue
+    return False
+
+
 def get_socks5_socket(proxy) -> tuple:
     """
     创建 SOCKS5 socket（用于 IMAP 等协议）。
