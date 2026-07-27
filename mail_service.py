@@ -248,6 +248,12 @@ def _graph_request(
         raise MailServiceError(f"token refresh failed: {exc}", tag="token_invalid") from exc
     except OAuthServiceError as exc:
         raise MailServiceError(f"token refresh failed: {exc}", tag="token_invalid") from exc
+    except Exception as exc:  # noqa: BLE001
+        # 任何非预期异常（网络/解析等）也必须转成 MailServiceError，
+        # 否则会穿透成 unexpected_error 且不触发协议回退到 IMAP
+        raise MailServiceError(
+            f"token refresh failed: {type(exc).__name__}: {exc}", tag="token_invalid"
+        ) from exc
 
     headers["Authorization"] = f"Bearer {access_token}"
 
@@ -885,6 +891,20 @@ def load_imap_messages(
                     f"IMAP OAuth2 令牌获取失败: {exc}",
                     tag="oauth_token_failed",
                 ) from exc
+        except Exception as exc:  # noqa: BLE001
+            # 任何非 OAuthServiceError 的异常（网络错误/解析错误等）也必须转成
+            # MailServiceError，否则会穿透成 unexpected_error 且不触发协议回退
+            if password:
+                logger.warning(
+                    "邮箱 account=%s IMAP 取 token 异常，回退到密码认证: error=%s",
+                    _account_log_id(account), type(exc).__name__,
+                )
+                use_oauth2 = False
+            else:
+                raise MailServiceError(
+                    f"IMAP 令牌获取异常: {type(exc).__name__}: {exc}",
+                    tag="oauth_token_failed",
+                ) from exc
 
     if not use_oauth2 and not password:
         raise MailServiceError(
@@ -1023,6 +1043,18 @@ def load_pop3_messages(
             else:
                 raise MailServiceError(
                     f"POP3 OAuth2 令牌获取失败: {exc}",
+                    tag="oauth_token_failed",
+                ) from exc
+        except Exception as exc:  # noqa: BLE001
+            if password:
+                logger.warning(
+                    "邮箱 account=%s POP3 取 token 异常，回退到密码认证: error=%s",
+                    _account_log_id(account), type(exc).__name__,
+                )
+                use_oauth2 = False
+            else:
+                raise MailServiceError(
+                    f"POP3 令牌获取异常: {type(exc).__name__}: {exc}",
                     tag="oauth_token_failed",
                 ) from exc
 

@@ -230,11 +230,13 @@ def refresh_mail_cache_async(
                 "后台刷新邮件缓存失败 account=%d folder=%s error=%s",
                 account_id, folder, error_msg,
             )
-        except Exception:  # noqa: BLE001
-            error_msg = "unexpected_error"
-            logger.warning(
-                "后台刷新邮件缓存异常 account=%d folder=%s error=%s",
-                account_id, folder, error_msg,
+        except Exception as exc:  # noqa: BLE001
+            # 记录完整堆栈，便于定位真正的失败原因；错误文案带上异常类型与信息，
+            # 不再是无意义的 "unexpected_error"，方便前端展示与排查。
+            error_msg = f"unexpected_error: {type(exc).__name__}: {str(exc)[:200]}"
+            logger.exception(
+                "后台刷新邮件缓存异常 account=%d folder=%s",
+                account_id, folder,
             )
         finally:
             watchdog.cancel()

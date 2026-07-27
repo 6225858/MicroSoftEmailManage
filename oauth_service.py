@@ -339,13 +339,27 @@ def _try_msauth_refresh(account: MailAccount, proxies: dict | None) -> dict:
             attempt=idx + 1,
             tag="refresh_attempt",
         )
-        response = _post_with_retry(
-            MSAUTH_TOKEN_URL,
-            data=req_data_full,
-            timeout=20,
-            proxies=proxies,
-            account_id=account.id,
-        )
+        try:
+            response = _post_with_retry(
+                MSAUTH_TOKEN_URL,
+                data=req_data_full,
+                timeout=20,
+                proxies=proxies,
+                account_id=account.id,
+            )
+        except requests.RequestException as exc:
+            # 网络错误（连接重置/超时/代理不可用）必须转成 OAuthServiceError，
+            # 否则会穿透所有 except MailServiceError/OAuthServiceError，直达 worker 顶层
+            # 变成 "unexpected_error" 且无法触发协议回退，导致整账号拉取失败。
+            last_error = OAuthServiceError(f"MSAuth token 请求网络错误: {exc}")
+            _oauth_log(
+                logging.WARNING,
+                account_id=account.id,
+                endpoint=MSAUTH_TOKEN_URL,
+                attempt=idx + 1,
+                tag="network_error",
+            )
+            continue
 
         if response.ok:
             payload = response.json()
