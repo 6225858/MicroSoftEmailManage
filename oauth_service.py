@@ -1,5 +1,6 @@
 import time
 import logging
+import threading
 from typing import Optional
 
 import requests
@@ -28,6 +29,9 @@ MSAUTH_SCOPE = "wl.imap wl.basic wl.offline_access"
 # 备选 scope：如果 wl.imap 失败，用更宽松的 wl.basic（仅基础资料 + 离线访问）
 # 这种情况下拿到的 access_token 不能直接调 Graph API，但能完成基础认证
 MSAUTH_SCOPE_FALLBACK = "wl.basic wl.offline_access"
+# 组织账号 IMAP/POP3 XOAUTH2 需要的 scope（标准 v2.0 端点，与 Graph 的 Mail.Read 不同）
+IMAP_SCOPES = "https://outlook.office.com/IMAP.AccessAsUser.All https://outlook.office.com/POP.AccessAsUser.All offline_access"
+IMAP_SCOPES_RELAXED = "https://outlook.office.com/IMAP.AccessAsUser.All offline_access"
 
 MSAUTH_TOKEN_PREFIXES = ("M.C", "M.R", "EwA", "EwB")
 
@@ -144,7 +148,14 @@ def _is_msauth_token(token: str) -> bool:
     return any(cleaned.startswith(prefix) for prefix in MSAUTH_TOKEN_PREFIXES)
 
 
-def _try_oauth2_refresh(token_url: str, account: MailAccount, proxies: dict | None, relax_scope_check: bool = False) -> dict:
+def _try_oauth2_refresh(
+    token_url: str,
+    account: MailAccount,
+    proxies: dict | None,
+    relax_scope_check: bool = False,
+    candidate_scopes: list | None = None,
+    require_scope_keyword: str | None = None,
+) -> dict:
     """
     标准 OAuth2 端点刷新。不同 client_id 注册时授权的 scope 不同，
     因此按以下顺序尝试，第一个成功【且 token 实际含 Mail.Read 权限】的就返回：
@@ -166,7 +177,7 @@ def _try_oauth2_refresh(token_url: str, account: MailAccount, proxies: dict | No
 
     # 多 scope fallback 顺序（删掉了 'openid profile email offline_access'，
     # 因为它拿到的 token 一定不含 Mail.Read）
-    candidate_scopes = [
+    candidate_scopes = candidate_scopes or [
         GRAPH_SCOPE,
         "https://graph.microsoft.com/.default offline_access",
         None,  # 不传 scope 参数，让 Azure AD 用 refresh_token 默认 scope
@@ -246,22 +257,25 @@ def _try_oauth2_refresh(token_url: str, account: MailAccount, proxies: dict | No
             )
             continue
 
-        # 关键：验证返回的 token 实际包含 Mail.Read 权限
+        # 关键：验证返回的 token 实际包含所需权限
         # OAuth2 响应的 scope 字段表示实际授予的 scope
         granted_scope = str(payload.get("scope", "")).lower()
-        has_mail_read = "mail.read" in granted_scope or "mail.readwrite" in granted_scope
+        if require_scope_keyword:
+            has_required = require_scope_keyword in granted_scope
+        else:
+            has_required = "mail.read" in granted_scope or "mail.readwrite" in granted_scope
 
-        if not has_mail_read and not relax_scope_check:
-            # 严格模式：token 缺少 Mail.Read 权限，跳过
+        if not has_required and not relax_scope_check:
+            # 严格模式：token 缺少所需权限，跳过
             _oauth_log(
                 logging.WARNING,
                 account_id=account.id,
                 endpoint=token_url,
                 attempt=attempt,
-                tag="missing_mail_read",
+                tag="missing_required_scope",
             )
             last_error = OAuthServiceError(
-                f"刷新成功但 token 缺少 Mail.Read 权限（实际 scope: {granted_scope[:100]}）"
+                f"刷新成功但 token 缺少所需权限（实际 scope: {granted_scope[:100]}）"
             )
             continue
 
@@ -410,10 +424,51 @@ def _store_tokens(account: MailAccount, db: Session, access_token: str, new_refr
     db.refresh(account)
 
 
-def get_valid_access_token(account: MailAccount, db: Session) -> str:
+# 按用途隔离的 token 内存缓存：(account_id, scope) -> {"token": str, "expire": float}
+# scope 分为 "graph"(需要 Mail.Read) 与 "imap"(需要 wl.imap / IMAP.AccessAsUser.All)。
+# 必须隔离：M.C 账号的 Graph 路径若缓存了 Mail.Read token，会污染 IMAP 路径（IMAP 需要 wl.imap）。
+_token_cache: dict = {}
+_token_cache_lock = threading.Lock()
+
+
+def _token_cache_get(account_id: int, scope: str) -> str | None:
+    key = (account_id, scope)
+    with _token_cache_lock:
+        c = _token_cache.get(key)
+        if c and c["expire"] > time.time():
+            return c["token"]
+    return None
+
+
+def _token_cache_set(account_id: int, scope: str, token: str, ttl: int) -> None:
+    key = (account_id, scope)
+    with _token_cache_lock:
+        _token_cache[key] = {"token": token, "expire": time.time() + ttl}
+
+
+def get_valid_access_token(
+    account: MailAccount,
+    db: Session,
+    required_scope: str = "graph",
+    force_refresh: bool = False,
+) -> str:
+    """获取可用的 access_token。
+
+    required_scope:
+    - "graph": Graph API 需要 Mail.Read 权限（标准 OAuth2 端点，严格校验 Mail.Read）。
+    - "imap":  IMAP/POP3 XOAUTH2 需要 IMAP 权限：
+               * M.C / 个人版 token → 用 MSAuth 端点刷新出 wl.imap token（最可靠）。
+               * 组织账号 → 用标准 OAuth2 端点请求 IMAP.AccessAsUser.All 权限。
+
+    按用途隔离缓存，避免不同协议互相污染 token。
+    """
     now = int(time.time())
-    if account.cached_access_token and account.access_token_expire_time > now:
-        return account.cached_access_token
+    scope_slot = "imap" if required_scope == "imap" else "graph"
+
+    if not force_refresh:
+        cached = _token_cache_get(account.id, scope_slot)
+        if cached:
+            return cached
 
     # 从代理池获取代理（自动轮询可用代理）
     proxies = get_session_proxy(db, account)
@@ -421,75 +476,116 @@ def get_valid_access_token(account: MailAccount, db: Session) -> str:
     last_error: OAuthServiceError | None = None
     is_msauth = _is_msauth_token(account.refresh_token)
 
-    # M.C 格式 token（MSAuth）：
-    # 先尝试标准 OAuth2 端点（放宽 scope 验证）→ 如果成功且 token 有 Mail.Read，Graph API 直接可用
-    # 失败 → fallback 到 MSAuth 端点 → 返回 wl.imap scope token → 仅 IMAP XOAUTH2 可用
-    if is_msauth:
-        for endpoint_attempt, token_url in enumerate((TOKEN_URL_CONSUMER, TOKEN_URL_COMMON), start=1):
-            try:
-                payload = _try_oauth2_refresh(token_url, account, proxies, relax_scope_check=True)
-                access_token = payload["access_token"]
-                new_refresh_token = _sanitize_token(str(payload.get("refresh_token") or ""))
-                expires_in = payload.get("expires_in")
-                _store_tokens(account, db, access_token, new_refresh_token, now,
-                              expires_in=int(expires_in) if expires_in else None)
-                return access_token
-            except OAuthServiceError as exc:
-                last_error = exc
-                _oauth_log(
-                    logging.WARNING,
-                    account_id=account.id,
-                    endpoint=token_url,
-                    attempt=endpoint_attempt,
-                    tag="refresh_failed",
-                )
+    def persist(payload: dict) -> str:
+        access_token = payload["access_token"]
+        new_refresh_token = _sanitize_token(str(payload.get("refresh_token") or ""))
+        expires_in = payload.get("expires_in")
+        _store_tokens(account, db, access_token, new_refresh_token, now,
+                      expires_in=int(expires_in) if expires_in else None)
+        # 缓存有效期：用 OAuth 响应中的 expires_in（留 5 分钟缓冲），否则 fallback 50 分钟
+        if expires_in and expires_in > 300:
+            ttl = expires_in - 300
+        else:
+            ttl = TOKEN_CACHE_SECONDS
+        _token_cache_set(account.id, scope_slot, access_token, ttl)
+        return access_token
 
-        # 标准 OAuth2 端点全部失败 → MSAuth 端点
-        _oauth_log(
-            logging.INFO,
-            account_id=account.id,
-            endpoint=MSAUTH_TOKEN_URL,
-            attempt=1,
-            tag="fallback_to_msauth",
-        )
-        try:
-            payload = _try_msauth_refresh(account, proxies)
-            access_token = payload["access_token"]
-            new_refresh_token = _sanitize_token(str(payload.get("refresh_token") or ""))
-            expires_in = payload.get("expires_in")
-            _store_tokens(account, db, access_token, new_refresh_token, now,
-                          expires_in=int(expires_in) if expires_in else None)
-            return access_token
-        except OAuthServiceError as exc:
-            last_error = exc
+    if scope_slot == "imap":
+        # ── IMAP / POP3 XOAUTH2 ──
+        if is_msauth:
+            # M.C 个人版 token：优先 MSAuth 端点刷新出 wl.imap token（IMAP 唯一可靠路径）
             _oauth_log(
-                logging.WARNING,
+                logging.INFO,
                 account_id=account.id,
                 endpoint=MSAUTH_TOKEN_URL,
                 attempt=1,
-                tag="refresh_failed",
+                tag="msauth_imap_refresh",
             )
-    else:
-        # 非 MSAuth token：标准 OAuth2 端点（严格 scope 验证）
-        for endpoint_attempt, token_url in enumerate((TOKEN_URL_CONSUMER, TOKEN_URL_COMMON), start=1):
             try:
-                payload = _try_oauth2_refresh(token_url, account, proxies)
-                access_token = payload["access_token"]
-                new_refresh_token = _sanitize_token(str(payload.get("refresh_token") or ""))
-                expires_in = payload.get("expires_in")
-                _store_tokens(account, db, access_token, new_refresh_token, now,
-                              expires_in=int(expires_in) if expires_in else None)
-                return access_token
+                payload = _try_msauth_refresh(account, proxies)
+                return persist(payload)
+            except OAuthServiceError as exc:
+                last_error = exc
+                _oauth_log(
+                    logging.WARNING,
+                    account_id=account.id,
+                    endpoint=MSAUTH_TOKEN_URL,
+                    attempt=1,
+                    tag="refresh_failed",
+                )
+            # MSAuth 失败 → 兜底尝试标准端点（部分 MSA 应用 client_id 可刷出含 IMAP 的 token）
+            for attempt_idx, token_url in enumerate((TOKEN_URL_CONSUMER, TOKEN_URL_COMMON), start=1):
+                try:
+                    payload = _try_oauth2_refresh(
+                        token_url, account, proxies,
+                        relax_scope_check=True,
+                        candidate_scopes=[IMAP_SCOPES, IMAP_SCOPES_RELAXED, None],
+                    )
+                    return persist(payload)
+                except OAuthServiceError as exc:
+                    last_error = exc
+                    _oauth_log(
+                        logging.WARNING,
+                        account_id=account.id,
+                        endpoint=token_url,
+                        attempt=attempt_idx,
+                        tag="refresh_failed",
+                    )
+        else:
+            # 组织账号：标准 OAuth2 端点请求 IMAP 权限
+            for attempt_idx, token_url in enumerate((TOKEN_URL_COMMON, TOKEN_URL_CONSUMER), start=1):
+                try:
+                    payload = _try_oauth2_refresh(
+                        token_url, account, proxies,
+                        relax_scope_check=False,
+                        candidate_scopes=[IMAP_SCOPES, IMAP_SCOPES_RELAXED, None],
+                        require_scope_keyword="imap",
+                    )
+                    return persist(payload)
+                except OAuthServiceError as exc:
+                    last_error = exc
+                    _oauth_log(
+                        logging.WARNING,
+                        account_id=account.id,
+                        endpoint=token_url,
+                        attempt=attempt_idx,
+                        tag="refresh_failed",
+                    )
+    else:
+        # ── Graph API（需要 Mail.Read）──
+        for attempt_idx, token_url in enumerate((TOKEN_URL_CONSUMER, TOKEN_URL_COMMON), start=1):
+            try:
+                payload = _try_oauth2_refresh(token_url, account, proxies, relax_scope_check=False)
+                return persist(payload)
             except OAuthServiceError as exc:
                 last_error = exc
                 _oauth_log(
                     logging.WARNING,
                     account_id=account.id,
                     endpoint=token_url,
-                    attempt=endpoint_attempt,
+                    attempt=attempt_idx,
+                    tag="refresh_failed",
+                )
+        if is_msauth:
+            # M.C 个人版 token 通常没有 Mail.Read，Graph 基本不可用，这里仅作兜底
+            try:
+                payload = _try_msauth_refresh(account, proxies)
+                return persist(payload)
+            except OAuthServiceError as exc:
+                last_error = exc
+                _oauth_log(
+                    logging.WARNING,
+                    account_id=account.id,
+                    endpoint=MSAUTH_TOKEN_URL,
+                    attempt=1,
                     tag="refresh_failed",
                 )
 
+    # 所有刷新失败 → 兜底返回已有 token（可能已过期，由调用方处理）
+    if account.cached_access_token and (account.access_token_expire_time or 0) > now + 30:
+        return account.cached_access_token
+    if account.access_token:
+        return account.access_token
     _oauth_log(
         logging.ERROR,
         account_id=account.id,

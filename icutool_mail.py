@@ -666,8 +666,9 @@ def preheat_accounts_async(account_ids: list[int], folder: str = "inbox", limit:
                 if not account or not account.refresh_token:
                     return False
                 # 1) 先预热 OAuth token:忽略已缓存的,强制刷新一次,提前暴露 token 问题
+                #    M.C 个人版账号取件走 IMAP(XOAUTH2,需 wl.imap),预热 imap scope 最贴合真实取件路径
                 try:
-                    get_valid_access_token(account, db)
+                    get_valid_access_token(account, db, required_scope="imap", force_refresh=True)
                 except OAuthServiceError:
                     logger.warning(
                         "账号 id=%s 预热 token 失败: error=oauth_token_failed",

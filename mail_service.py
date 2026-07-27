@@ -12,7 +12,7 @@ import requests
 from sqlalchemy.orm import Session
 
 from models import MailAccount
-from oauth_service import OAuthServiceError, get_valid_access_token
+from oauth_service import OAuthServiceError, get_valid_access_token, _is_msauth_token
 from proxy_service import get_session_proxy, get_proxied_socket_factory
 
 
@@ -243,7 +243,7 @@ def _graph_request(
     }
 
     try:
-        access_token = get_valid_access_token(account, db)
+        access_token = get_valid_access_token(account, db, required_scope="graph")
     except requests.HTTPError as exc:
         raise MailServiceError(f"token refresh failed: {exc}", tag="token_invalid") from exc
     except OAuthServiceError as exc:
@@ -430,7 +430,12 @@ def _can_use_protocol(protocol: str, account: MailAccount) -> bool:
             )
         return has_creds
     if protocol in ("imap", "pop3"):
-        return bool((account.password or "").strip())
+        # 密码认证或 OAuth2(XOAUTH2) 认证都可取件，二选一即可
+        has_password = bool((account.password or "").strip())
+        has_oauth = bool(
+            (account.refresh_token or "").strip() and (account.client_id or "").strip()
+        )
+        return has_password or has_oauth
     return False
 
 
@@ -464,6 +469,11 @@ def _load_with_protocol_selection(
         chain = [last_used] + [p for p in _PROTOCOL_CHAIN if p != last_used]
     else:
         chain = list(_PROTOCOL_CHAIN)
+
+    # M.C / 个人版(Microsoft Account)token 只有 wl.imap/wl.basic scope，没有 Mail.Read，
+    # Graph API 必定 401，因此优先走 IMAP/POP3(XOAUTH2)，跳过必失败的 Graph，避免无效等待。
+    if _is_msauth_token(account.refresh_token):
+        chain = [p for p in ("imap", "pop3", "graph") if p in chain]
 
     last_error: MailServiceError | None = None
     tried: list[str] = []
@@ -861,7 +871,7 @@ def load_imap_messages(
 
     if use_oauth2:
         try:
-            access_token = get_valid_access_token(account, db)
+            access_token = get_valid_access_token(account, db, required_scope="imap")
         except OAuthServiceError as exc:
             # OAuth2 失败时若仍有密码，fallback 到密码认证
             if password:
@@ -1001,7 +1011,7 @@ def load_pop3_messages(
 
     if use_oauth2:
         try:
-            access_token = get_valid_access_token(account, db)
+            access_token = get_valid_access_token(account, db, required_scope="imap")
         except OAuthServiceError as exc:
             # OAuth2 失败时若仍有密码，fallback 到密码认证
             if password:

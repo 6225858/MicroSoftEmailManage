@@ -25,6 +25,10 @@ CACHE_TTL = 300  # 5 分钟
 _refresh_tasks: dict[tuple[int, str], "RefreshTask"] = {}
 _refresh_lock = threading.Lock()
 
+# 后台刷新看门狗：若单次刷新超过该秒数仍未完成（如网络卡死），强制将刷新任务标记为结束，
+# 避免 is_refreshing 永远为 True 导致前端一直显示"正在拉取最新邮件"。
+REFRESH_WATCHDOG_SECONDS = 90
+
 
 class RefreshTask:
     """表示一次后台刷新任务，可被等待。"""
@@ -188,6 +192,16 @@ def refresh_mail_cache_async(
             _refresh_tasks[key].event.set()
         _refresh_tasks[key] = task
 
+    def _watchdog() -> None:
+        # 看门狗：若刷新线程卡死超过阈值仍未结束，强制标记完成，
+        # 防止 is_refreshing 永远为 True 导致前端一直显示"正在拉取最新邮件"。
+        if not task.event.is_set():
+            task.done(error="刷新超时(看门狗)", item_count=-1)
+
+    watchdog = threading.Timer(REFRESH_WATCHDOG_SECONDS, _watchdog)
+    watchdog.daemon = True
+    watchdog.start()
+
     def worker() -> None:
         error_msg: Optional[str] = None
         item_count = -1
@@ -223,6 +237,7 @@ def refresh_mail_cache_async(
                 account_id, folder, error_msg,
             )
         finally:
+            watchdog.cancel()
             task.done(error=error_msg, item_count=item_count)
             with _refresh_lock:
                 # 只有当前注册的还是我们的 task 时才清理
