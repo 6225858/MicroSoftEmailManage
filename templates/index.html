@@ -97,6 +97,8 @@
                         </div>
 
                         <div class="stack gap-sm">
+                            <div id="tag-stats-strip" class="tag-stats-strip" aria-live="polite"></div>
+
                             <div class="bulk-select-row" data-bulk-target="accounts">
                                 <label class="bulk-checkbox">
                                     <input type="checkbox" id="accounts-bulk-select-all">
@@ -104,6 +106,7 @@
                                 </label>
                                 <span class="bulk-summary">已选 <strong class="bulk-selected-count">0</strong> / <span class="bulk-total-count">0</span></span>
                                 <div class="bulk-action-buttons">
+                                    <button class="button button-ghost bulk-tag-btn" type="button" id="accounts-bulk-tag-btn" disabled>批量打标签</button>
                                     <button class="button button-ghost bulk-refresh-btn" type="button" id="accounts-bulk-refresh-btn" disabled>刷新选中</button>
                                     <button class="button button-danger bulk-delete-btn" type="button" id="accounts-bulk-delete-btn" disabled>删除选中</button>
                                 </div>
@@ -190,6 +193,7 @@
                                 </label>
                                 <span class="bulk-summary">已选 <strong class="bulk-selected-count">0</strong> / <span class="bulk-total-count">0</span></span>
                                 <div class="bulk-action-buttons">
+                                    <button class="button button-ghost bulk-tag-btn" type="button" id="mails-bulk-tag-btn" disabled>批量打标签</button>
                                     <button class="button button-ghost bulk-refresh-btn" type="button" id="mails-bulk-refresh-btn" disabled>刷新选中</button>
                                     <button class="button button-danger bulk-delete-btn" type="button" id="mails-bulk-delete-btn" disabled>删除选中</button>
                                 </div>
@@ -695,6 +699,52 @@
             <div class="modal-actions">
                 <button id="delete-confirm-cancel-btn" class="button button-ghost" type="button">取消</button>
                 <button id="delete-confirm-save-btn" class="button button-danger" type="button">确认删除</button>
+            </div>
+        </section>
+    </div>
+
+    <div id="batch-tags-modal" class="modal-shell" hidden>
+        <div id="batch-tags-backdrop" class="modal-backdrop"></div>
+        <section class="modal-card" role="dialog" aria-modal="true" aria-labelledby="batch-tags-title">
+            <div class="modal-head">
+                <div>
+                    <p class="eyebrow">Batch Tags</p>
+                    <h3 id="batch-tags-title">批量设置标签</h3>
+                    <p class="muted">对选中的邮箱账号统一添加 / 移除 / 替换标签</p>
+                </div>
+                <button id="batch-tags-close-btn" class="icon-button" type="button" aria-label="关闭批量标签弹窗">×</button>
+            </div>
+
+            <div class="batch-tags-summary" id="batch-tags-summary"></div>
+
+            <div class="stack gap-sm">
+                <label class="field-label" for="batch-tags-mode">操作模式</label>
+                <select id="batch-tags-mode" class="input filter-select">
+                    <option value="add">添加标签（保留已有）</option>
+                    <option value="remove">移除指定标签</option>
+                    <option value="set">替换全部标签</option>
+                </select>
+            </div>
+
+            <div class="stack gap-sm">
+                <label class="field-label" for="batch-tags-input">标签内容</label>
+                <input id="batch-tags-input" class="input" type="text" placeholder="例如：注册号，站点A，重点关注">
+                <div class="modal-hint-row">
+                    <span>多个标签请用逗号分隔（add / remove 模式）</span>
+                    <span>Ctrl + Enter 快速应用</span>
+                </div>
+            </div>
+
+            <div class="stack gap-sm">
+                <span class="field-label">快速填入已有标签</span>
+                <div id="batch-tags-suggestions" class="tag-modal-suggestions"></div>
+            </div>
+
+            <p id="batch-tags-message" class="message modal-message"></p>
+
+            <div class="modal-actions">
+                <button id="batch-tags-cancel-btn" class="button button-ghost" type="button">取消</button>
+                <button id="batch-tags-save-btn" class="button" type="button">应用</button>
             </div>
         </section>
     </div>

@@ -333,6 +333,20 @@ const elements = {
     mailsBulkSelectAll: document.getElementById("mails-bulk-select-all"),
     mailsBulkDeleteBtn: document.getElementById("mails-bulk-delete-btn"),
     mailsBulkRefreshBtn: document.getElementById("mails-bulk-refresh-btn"),
+    // 批量标签相关元素
+    accountsBulkTagBtn: document.getElementById("accounts-bulk-tag-btn"),
+    mailsBulkTagBtn: document.getElementById("mails-bulk-tag-btn"),
+    tagStatsStrip: document.getElementById("tag-stats-strip"),
+    batchTagsModal: document.getElementById("batch-tags-modal"),
+    batchTagsBackdrop: document.getElementById("batch-tags-backdrop"),
+    batchTagsCloseBtn: document.getElementById("batch-tags-close-btn"),
+    batchTagsCancelBtn: document.getElementById("batch-tags-cancel-btn"),
+    batchTagsSaveBtn: document.getElementById("batch-tags-save-btn"),
+    batchTagsMode: document.getElementById("batch-tags-mode"),
+    batchTagsInput: document.getElementById("batch-tags-input"),
+    batchTagsSummary: document.getElementById("batch-tags-summary"),
+    batchTagsSuggestions: document.getElementById("batch-tags-suggestions"),
+    batchTagsMessage: document.getElementById("batch-tags-message"),
     deleteAccountBtn: document.getElementById("delete-account-btn"),
     deleteConfirmModal: document.getElementById("delete-confirm-modal"),
     deleteConfirmBackdrop: document.getElementById("delete-confirm-backdrop"),
@@ -377,6 +391,11 @@ const text = {
     tagPreviewEmpty: "输入后会在这里实时预览标签效果",
     tagCurrentEmpty: "当前还没有标签",
     savingTags: "保存中...",
+    bulkTagNone: "请先勾选要设置标签的邮箱账号",
+    bulkTagEmpty: "请填写要添加或移除的标签内容",
+    applyingTags: "应用中...",
+    bulkTagSuccess: (n) => `批量标签已更新 ${n} 个账号`,
+    bulkTagNotFound: (n) => `，${n} 个账号未找到（可能已被删除）`,
     copyMailAddressSuccess: "邮箱地址已复制",
     copyMailAddressUnavailable: "当前没有可复制的邮箱地址",
     bulkDeleteNone: "请先勾选要删除的邮箱账号",
@@ -1085,6 +1104,11 @@ function updateBulkUI(target, visibleAccounts) {
             refreshBtnEl.textContent = "刷新选中";
         }
     }
+    // 批量打标签按钮：有选中即可用
+    const tagBtnEl = target === "mails" ? elements.mailsBulkTagBtn : elements.accountsBulkTagBtn;
+    if (tagBtnEl) {
+        tagBtnEl.disabled = !canAct;
+    }
 }
 
 function clearAccountSelection() {
@@ -1212,6 +1236,122 @@ async function deleteSingleAccount(accountId) {
         elements.deleteAccountBtn.disabled = !state.selectedAccountId;
         elements.deleteAccountBtn.textContent = "删除此账号";
     }
+}
+
+// ─── 批量标签操作 ─────────────────────────────────────
+function openBatchTagsModal() {
+    if (state.selectedAccountIds.size === 0) return;
+    state.batchTagsReturnFocus = document.activeElement;
+    elements.batchTagsSummary.textContent = `已选中 ${state.selectedAccountIds.size} 个邮箱账号`;
+    elements.batchTagsMessage.textContent = "";
+    elements.batchTagsMessage.classList.remove("is-error");
+    elements.batchTagsMode.value = "add";
+    elements.batchTagsInput.value = "";
+    renderBatchTagsSuggestions();
+    elements.batchTagsModal.hidden = false;
+    elements.batchTagsInput.focus();
+}
+
+function closeBatchTagsModal() {
+    elements.batchTagsModal.hidden = true;
+    if (state.batchTagsReturnFocus && typeof state.batchTagsReturnFocus.focus === "function") {
+        state.batchTagsReturnFocus.focus();
+        state.batchTagsReturnFocus = null;
+    }
+}
+
+function renderBatchTagsSuggestions() {
+    const available = getAllAvailableTags();
+    if (!available.length) {
+        elements.batchTagsSuggestions.innerHTML = `<span class="muted">暂无已有标签</span>`;
+        return;
+    }
+    elements.batchTagsSuggestions.innerHTML = available.map((tag) =>
+        `<button type="button" class="tag tag-suggestion" data-tag="${escapeHtml(tag)}">${escapeHtml(tag)}</button>`
+    ).join("");
+    elements.batchTagsSuggestions.querySelectorAll(".tag-suggestion").forEach((btn) => {
+        btn.addEventListener("click", () => {
+            const tag = btn.dataset.tag;
+            const parts = elements.batchTagsInput.value.split(",").map((t) => t.trim()).filter(Boolean);
+            if (!parts.includes(tag)) parts.push(tag);
+            elements.batchTagsInput.value = parts.join(", ");
+            elements.batchTagsInput.focus();
+        });
+    });
+}
+
+async function applyBatchTags() {
+    const ids = Array.from(state.selectedAccountIds);
+    if (ids.length === 0) {
+        setMessage(elements.batchTagsMessage, text.bulkTagNone, true);
+        return;
+    }
+    const mode = elements.batchTagsMode.value;
+    const tags = elements.batchTagsInput.value.trim();
+    if ((mode === "add" || mode === "remove") && !tags) {
+        setMessage(elements.batchTagsMessage, text.bulkTagEmpty, true);
+        return;
+    }
+
+    try {
+        elements.batchTagsSaveBtn.disabled = true;
+        elements.batchTagsSaveBtn.textContent = text.applyingTags;
+        const data = await api("/api/accounts/batch-tags", {
+            method: "POST",
+            body: JSON.stringify({ ids, tags, mode })
+        });
+        // 本地同步更新标签，避免重新拉取整个列表
+        Object.entries(data.tags || {}).forEach(([idStr, newTags]) => {
+            const id = Number(idStr);
+            const account = state.accounts.find((item) => item.id === id);
+            if (account) account.tags = newTags;
+        });
+        updateTagFilterOptions();
+        renderAccounts();
+        loadTagStats();
+        closeBatchTagsModal();
+        const msg = text.bulkTagSuccess(data.updated) + (data.not_found ? text.bulkTagNotFound(data.not_found) : "");
+        setMessage(elements.accountMessage, msg, false);
+    } catch (error) {
+        setMessage(elements.batchTagsMessage, error.message, true);
+    } finally {
+        elements.batchTagsSaveBtn.disabled = false;
+        elements.batchTagsSaveBtn.textContent = "应用";
+    }
+}
+
+// ─── 标签统计概览 ─────────────────────────────────────
+async function loadTagStats() {
+    try {
+        const data = await api("/api/accounts/tag-stats");
+        renderTagStats(data);
+    } catch (error) {
+        // 统计失败不应影响主流程
+        if (elements.tagStatsStrip) {
+            elements.tagStatsStrip.innerHTML = "";
+        }
+    }
+}
+
+function renderTagStats(data) {
+    if (!elements.tagStatsStrip) return;
+    const parts = [];
+    parts.push(`<span class="tag-stat tag-stat-total">总计 <strong>${data.total}</strong></span>`);
+    parts.push(`<span class="tag-stat tag-stat-none">未标签 <strong>${data.no_tag_count}</strong></span>`);
+    (data.tags || []).forEach((item) => {
+        const active = elements.tagFilter.value === item.tag ? " is-active" : "";
+        parts.push(
+            `<button type="button" class="tag tag-stat-chip${active}" data-tag="${escapeHtml(item.tag)}">` +
+            `${escapeHtml(item.tag)} <span class="tag-stat-count">${item.count}</span></button>`
+        );
+    });
+    elements.tagStatsStrip.innerHTML = parts.join("");
+    elements.tagStatsStrip.querySelectorAll(".tag-stat-chip").forEach((btn) => {
+        btn.addEventListener("click", () => {
+            elements.tagFilter.value = btn.dataset.tag;
+            elements.tagFilter.dispatchEvent(new Event("change"));
+        });
+    });
 }
 
 // ─── 批量刷新邮件 ─────────────────────────────────────
@@ -1559,6 +1699,7 @@ async function loadAccounts({ silent = false } = {}) {
         const data = await api("/api/accounts");
         state.accounts = (data.items || []).slice().sort((left, right) => right.id - left.id);
         updateTagFilterOptions();
+        loadTagStats();
 
         if (state.selectedAccountId && !state.accounts.some((item) => item.id === state.selectedAccountId)) {
             state.selectedAccountId = null;
@@ -2652,6 +2793,24 @@ if (elements.accountsBulkRefreshBtn) {
 }
 if (elements.mailsBulkRefreshBtn) {
     elements.mailsBulkRefreshBtn.addEventListener("click", refreshSelectedAccounts);
+}
+if (elements.accountsBulkTagBtn) {
+    elements.accountsBulkTagBtn.addEventListener("click", openBatchTagsModal);
+}
+if (elements.mailsBulkTagBtn) {
+    elements.mailsBulkTagBtn.addEventListener("click", openBatchTagsModal);
+}
+if (elements.batchTagsSaveBtn) {
+    elements.batchTagsSaveBtn.addEventListener("click", applyBatchTags);
+    elements.batchTagsCancelBtn.addEventListener("click", closeBatchTagsModal);
+    elements.batchTagsCloseBtn.addEventListener("click", closeBatchTagsModal);
+    elements.batchTagsBackdrop.addEventListener("click", closeBatchTagsModal);
+    elements.batchTagsInput.addEventListener("keydown", (event) => {
+        if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+            event.preventDefault();
+            applyBatchTags();
+        }
+    });
 }
 if (elements.deleteAccountBtn) {
     elements.deleteAccountBtn.addEventListener("click", () => {

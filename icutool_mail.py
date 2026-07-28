@@ -52,7 +52,7 @@ from chatgpt_automation_service import (
 logger = logging.getLogger("icutool_mail")
 
 # ── 应用版本 & 配置 ──────────────────────────────────────
-APP_VERSION = "1.3.3"
+APP_VERSION = "1.3.4"
 DEFAULT_GITHUB_REPO = "6225858/MicroSoftEmailManage"
 SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
 
@@ -186,6 +186,28 @@ class BatchRefreshBody(BaseModel):
     ids: list[int]
     folder: str = "inbox"
     limit: int = 20
+
+
+class BatchTagsBody(BaseModel):
+    """批量标签操作：对一组账号统一添加 / 移除 / 替换标签。"""
+
+    ids: list[int] = []
+    tags: str = ""
+    mode: str = "add"  # add | remove | set
+
+
+def _remove_tag_from_str(current: str, tag: str) -> str:
+    """从逗号分隔的标签串中移除单个标签（不区分中英文逗号 / 前后空格）。"""
+    return ", ".join(
+        t.strip() for t in (current or "").split(",") if t.strip() and t.strip() != tag
+    )
+
+
+def _normalize_tags(value: str) -> str:
+    """折叠多余空白与中英文逗号，得到规范化的标签串。"""
+    return ", ".join(
+        t.strip() for t in (value or "").replace("，", ",").split(",") if t.strip()
+    )
 
 
 class ApiKeyBody(BaseModel):
@@ -1345,6 +1367,89 @@ def update_tags(account_id: int, body: TagsBody, db: Session = Depends(get_db)):
     account.tags = normalize_tags(body.tags)
     db.commit()
     return {"ok": True, "tags": account.tags}
+
+
+@app.post("/api/accounts/batch-tags", dependencies=[Depends(require_api_key)])
+def batch_update_tags(body: BatchTagsBody, db: Session = Depends(get_db)):
+    """对一组账号批量添加 / 移除 / 替换标签。
+
+    mode:
+      - add   : 在现有标签基础上追加（去重，保留原顺序）
+      - remove: 从现有标签中移除指定标签
+      - set   : 直接覆盖为指定标签
+    """
+    mode = (body.mode or "add").lower().strip()
+    if mode not in ("add", "remove", "set"):
+        raise HTTPException(status_code=400, detail="mode 必须是 add / remove / set")
+
+    # 过滤 + 去重 id
+    seen: set[int] = set()
+    account_ids: list[int] = []
+    for raw in body.ids:
+        try:
+            aid = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if aid not in seen:
+            seen.add(aid)
+            account_ids.append(aid)
+    if not account_ids:
+        raise HTTPException(status_code=400, detail="ids 不能为空")
+
+    accounts = db.query(MailAccount).filter(MailAccount.id.in_(account_ids)).all()
+    found_ids = {acc.id for acc in accounts}
+
+    new_tags_for: dict[int, str] = {}
+    for account in accounts:
+        current = account.tags or ""
+        if mode == "add":
+            existing = [t.strip() for t in current.replace("，", ",").split(",") if t.strip()]
+            for tag in _normalize_tags(body.tags).split(", "):
+                if tag and tag not in existing:
+                    existing.append(tag)
+            normalized = ", ".join(existing)
+        elif mode == "remove":
+            normalized = current
+            for tag in _normalize_tags(body.tags).split(", "):
+                normalized = _remove_tag_from_str(normalized, tag)
+        else:  # set
+            normalized = _normalize_tags(body.tags)
+        account.tags = normalized
+        new_tags_for[account.id] = normalized
+
+    db.commit()
+    return {
+        "ok": True,
+        "updated": len(accounts),
+        "not_found": len(account_ids) - len(found_ids),
+        "tags": new_tags_for,
+    }
+
+
+@app.get("/api/accounts/tag-stats", dependencies=[Depends(require_api_key)])
+def tag_stats(db: Session = Depends(get_db)):
+    """标签统计概览：各标签下的账号数量、未打标签账号数、总账号数。"""
+    accounts = db.query(MailAccount).all()
+    counter: dict[str, int] = {}
+    no_tag = 0
+    for account in accounts:
+        tags = [t.strip() for t in (account.tags or "").replace("，", ",").split(",") if t.strip()]
+        if not tags:
+            no_tag += 1
+            continue
+        for tag in tags:
+            counter[tag] = counter.get(tag, 0) + 1
+
+    tags_list = [
+        {"tag": tag, "count": count}
+        for tag, count in sorted(counter.items(), key=lambda kv: (-kv[1], kv[0]))
+    ]
+    return {
+        "total": len(accounts),
+        "no_tag_count": no_tag,
+        "tag_count": len(tags_list),
+        "tags": tags_list,
+    }
 
 
 @app.post("/api/accounts/{account_id}/remark", dependencies=[Depends(require_api_key)])
