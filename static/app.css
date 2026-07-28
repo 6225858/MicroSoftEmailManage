@@ -789,6 +789,23 @@ time,
     opacity: 1;
 }
 
+/* 标签弹窗内的“当前标签”：删除符号常显，无需 hover 即可点删 */
+.tag-modal-current-tags {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 7px;
+    margin-bottom: 4px;
+}
+
+.tag-modal-current-tags .tag {
+    position: relative;
+    padding-right: 16px;
+}
+
+.tag-modal-current-tags .tag-remove {
+    opacity: 1;
+}
+
 .proxy-warning-banner {
     display: flex;
     align-items: center;

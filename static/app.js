@@ -2345,6 +2345,12 @@ async function removeTagFromAccount(accountId, tag) {
 
     try {
         await persistTags(accountId, nextTags);
+        // 标签弹窗正打开且为当前账号时，直接同步弹窗内的当前标签与输入框，
+        // 无需改动“标签内容”文本框即可即时删除某个标签
+        if (state.tagModalAccountId === accountId && !elements.tagModal.hidden) {
+            elements.tagModalCurrentTags.innerHTML = renderTagMarkup(account.tags, text.tagCurrentEmpty, "tag", true);
+            elements.tagModalInput.value = account.tags || "";
+        }
     } catch (error) {
         setMessage(elements.accountMessage, error.message, true);
     }
@@ -2475,7 +2481,7 @@ function openTagModal(account) {
     state.tagModalReturnFocus = document.activeElement;
 
     elements.tagModalEmail.textContent = account.email;
-    elements.tagModalCurrentTags.innerHTML = renderTagMarkup(account.tags, text.tagCurrentEmpty);
+    elements.tagModalCurrentTags.innerHTML = renderTagMarkup(account.tags, text.tagCurrentEmpty, "tag", true);
     elements.tagModalInput.value = account.tags || "";
     syncTagModalTagViews(account.tags || "");
     setMessage(elements.tagModalMessage, "", false);
@@ -2730,6 +2736,15 @@ elements.tagModalSuggestions.addEventListener("click", (event) => {
     applyQuickTag(button.dataset.tag);
 });
 elements.tagModalSaveBtn.addEventListener("click", saveTagModalTags);
+// 标签弹窗内的“当前标签”直接点 × 即可删除（即时持久化，无需改动标签内容输入框）
+elements.tagModalCurrentTags.addEventListener("click", (event) => {
+    const removeBtn = event.target.closest(".tag-remove[data-tag]");
+    if (!removeBtn) {
+        return;
+    }
+    event.stopPropagation();
+    removeTagFromAccount(state.tagModalAccountId, removeBtn.dataset.tag);
+});
 // 点击账号卡片标签右上角的删除符号即可移除该标签（弹窗内的预览/当前标签不含 account 上下文，不触发）
 document.addEventListener("click", (event) => {
     const removeBtn = event.target.closest(".tag-remove[data-tag]");
