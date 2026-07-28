@@ -48,8 +48,8 @@ IMAP_FOLDER_ALIASES = {
     "junk": ["junk", "junk email", "junkemail", "垃圾邮件", "垃圾箱"],
 }
 
-# 邮件列表查询字段
-LIST_SELECT = "id,subject,from,toRecipients,receivedDateTime,body"
+# 邮件列表查询字段（列表不需要正文，详情才拉取 body，避免无谓流量）
+LIST_SELECT = "id,subject,from,toRecipients,receivedDateTime"
 # 单封邮件详情查询字段
 DETAIL_SELECT = "id,subject,from,toRecipients,ccRecipients,bccRecipients,replyTo,receivedDateTime,body"
 
@@ -82,6 +82,20 @@ SAFE_MAIL_LOG_TAGS = frozenset({
 def safe_mail_error_tag(error: BaseException) -> str:
     tag = str(getattr(error, "tag", "") or "")
     return tag if tag in SAFE_MAIL_LOG_TAGS else "mail_service_error"
+
+
+# 成功取件后应被清空的瞬态错误标签（避免脏标签一直残留）
+TRANSIENT_ERROR_TAGS = SAFE_MAIL_LOG_TAGS
+
+# 进程内记录已知 Graph 必然 401 的账号（如未识别的 M.C token），
+# 后续取件跳过必败的 Graph 首试，避免每次都浪费一次 30s 超时。
+_graph_401_accounts: set[int] = set()
+
+
+def _mark_graph_401(account: MailAccount) -> None:
+    account_id = getattr(account, "id", None)
+    if account_id is not None:
+        _graph_401_accounts.add(account_id)
 
 
 def _account_log_id(account: MailAccount) -> str:
@@ -286,6 +300,8 @@ def _graph_request(
             "邮箱 account=%s Graph API 401，error=token_invalid，将 fallback 到 IMAP",
             _account_log_id(account),
         )
+        # 记录该账号 Graph 必然失败，后续自动取件跳过 Graph 首试
+        _mark_graph_401(account)
         raise MailServiceError(
             f"Graph API 401（token scope: {token_scope[:80] or '未知'}, "
             f"错误: {graph_error[:120]}），将尝试 IMAP/POP3",
@@ -481,6 +497,12 @@ def _load_with_protocol_selection(
     if _is_msauth_token(account.refresh_token):
         chain = [p for p in ("imap", "pop3", "graph") if p in chain]
 
+    # 已知该账号 Graph 必然 401（如未识别的 M.C token），把 Graph 移到最后，
+    # 避免每次自动取件都先浪费一次 30s 超时
+    account_id = getattr(account, "id", None)
+    if account_id is not None and account_id in _graph_401_accounts and "graph" in chain:
+        chain = [p for p in chain if p != "graph"] + ["graph"]
+
     last_error: MailServiceError | None = None
     tried: list[str] = []
     errors: list[str] = []  # 收集所有协议的失败原因
@@ -516,10 +538,9 @@ def _load_with_protocol_selection(
             # 成功 → 记录到 last_used_protocol（不修改 protocol 字段）
             if last_used != protocol:
                 account.last_used_protocol = protocol
-                # 清空旧的 token_invalid 标签
-                _remove_tag(account, "token_invalid")
-                _remove_tag(account, "imap_auth_failed")
-                _remove_tag(account, "pop3_auth_failed")
+                # 成功取件后清空所有瞬态错误标签（避免脏标签残留）
+                for err_tag in TRANSIENT_ERROR_TAGS:
+                    _remove_tag(account, err_tag)
                 db.commit()
                 logger.info(
                     "邮箱 account=%s %s 协议取件成功，已记录到 last_used_protocol",
@@ -642,6 +663,78 @@ def load_account_mails_with_protocol(
     return load_mail_messages(account, db, folder=folder, limit=limit)
 
 
+def _resolve_effective_protocol(account: MailAccount) -> str:
+    """返回实际生效的取件协议（auto 模式以 last_used_protocol 为准）。"""
+    protocol = (getattr(account, "protocol", None) or "auto").lower().strip()
+    if protocol == "auto":
+        last_used = (getattr(account, "last_used_protocol", "") or "").lower().strip()
+        return last_used or "imap"
+    return protocol
+
+
+def list_mail_refs(account: MailAccount, db: Session, folder: str, limit: int) -> list[dict]:
+    """列出最近 limit 封邮件的元数据(不含正文)，供增量刷新比对哪些是新邮件。
+
+    复用现有的列表取件逻辑：IMAP/Graph 列表本就只取元数据（正文在打开单封时按需拉取），
+    POP3 列表本身含正文。返回结构与 load_account_mails 一致。
+    """
+    return load_account_mails(account, db, folder=folder, limit=limit)
+
+
+def fetch_mail_full(
+    account: MailAccount, db: Session, folder: str, ref: dict
+) -> dict | None:
+    """根据元数据引用补取单封邮件的完整正文（增量刷新时对"新邮件"调用）。
+
+    - graph/imap：按 ref["id"] 精准拉取正文；
+    - pop3：列表已含正文，直接复用 ref，无需额外请求。
+    """
+    mail_id = ref.get("id") or ""
+    protocol = _resolve_effective_protocol(account)
+    if protocol == "graph":
+        return load_single_mail(account, db, mail_id=mail_id, folder=folder)
+    if protocol == "imap":
+        return _load_single_imap_mail(account, db, mail_id, folder)
+    return ref
+
+
+def merge_incremental_mails(
+    account: MailAccount,
+    db: Session,
+    folder: str,
+    limit: int,
+    existing_items: list[dict],
+) -> tuple[list[dict], int]:
+    """增量合并最近邮件：已缓存的复用(含正文)，新邮件补取正文。
+
+    返回 (合并后的邮件列表, 新邮件数量)。合并结果按服务端顺序(最新在前)，截断到 limit。
+    已缓存的邮件（其正文可能来自上一次打开时写回的缓存）直接复用，避免重复下载正文，
+    因此"刷新"只会对真正新增的邮件取正文，显著提速。
+    """
+    refs = list_mail_refs(account, db, folder, limit) or []
+    existing_map = {item.get("id"): item for item in (existing_items or []) if item.get("id")}
+    merged: list[dict] = []
+    new_count = 0
+    for ref in refs:  # refs 为最新在前
+        mid = ref.get("id")
+        cached = existing_map.get(mid)
+        if cached is not None:
+            # 复用已缓存邮件（可能已含正文）
+            merged.append(cached)
+            continue
+        try:
+            full = fetch_mail_full(account, db, folder, ref)
+        except Exception as exc:  # 单封补取失败不应中断整体增量刷新
+            logger.warning("增量刷新补取新邮件失败 account=%s mail=%s: %s",
+                           _account_log_id(account), mid, exc)
+            full = ref
+        merged.append(full if full is not None else ref)
+        new_count += 1
+    if len(merged) > limit:
+        merged = merged[:limit]
+    return merged, new_count
+
+
 # ──────────────────────────── IMAP 取件 ────────────────────────────
 
 
@@ -699,7 +792,7 @@ def _parse_imap_message(msg) -> dict:
 
     body_html = _extract_email_body(msg)
     return {
-        "id": (msg.get("Message-ID") or "")[:200],
+        "id": msg.get("Message-ID") or "",
         "subject": subject,
         "mail_from": mail_from,
         "mail_to": mail_to,
@@ -862,16 +955,10 @@ class _ProxiedPOP3(poplib.POP3):
         return super()._create_socket(timeout)
 
 
-def load_imap_messages(
-    account: MailAccount,
-    db: Session,
-    folder: str = "inbox",
-    limit: int = 20,
-) -> list[dict]:
-    """通过 IMAP 协议取件。
-    - 如果账号有 refresh_token + client_id，优先用 OAuth2 access_token (XOAUTH2) 认证
-    - 否则用邮箱密码认证
-    两种方式自动切换，无需用户手动选择。
+def get_imap_conn(account: MailAccount, db: Session):
+    """建立并返回已认证的 IMAP 连接（含 SSL/代理/OAuth2(XOAUTH2) 或密码认证）。
+
+    抽取自 load_imap_messages，供单封取件复用，避免重复连接逻辑。
     """
     server, port, use_ssl = _resolve_imap_config(account)
     password = account.password or ""
@@ -964,34 +1051,72 @@ def load_imap_messages(
                     f"IMAP login failed: {exc}",
                     tag="imap_auth_failed",
                 ) from exc
+    except Exception:
+        # 认证失败要释放连接
+        try:
+            mail.logout()
+        except Exception:
+            pass
+        raise
 
+    return mail
+
+
+def load_imap_messages(
+    account: MailAccount,
+    db: Session,
+    folder: str = "inbox",
+    limit: int = 20,
+) -> list[dict]:
+    """通过 IMAP 协议取件。
+    - 如果账号有 refresh_token + client_id，优先用 OAuth2 access_token (XOAUTH2) 认证
+    - 否则用邮箱密码认证
+    两种方式自动切换，无需用户手动选择。
+    """
+    mail = get_imap_conn(account, db)
+    try:
         target_folder = _select_imap_folder(mail, folder)
         status, _data = mail.select(target_folder, readonly=True)
         if status != "OK":
             # 如果文件夹不存在，回退到 INBOX
             mail.select("INBOX", readonly=True)
 
-        # 取最近 limit 封
-        status, data = mail.search(None, "ALL")
-        if status != "OK":
+        # 取最近 limit 封（按序号倒序，最新在前）
+        try:
+            status, data = mail.search(None, "ALL")
+        except imaplib.IMAP4.abort:
+            return []
+        if status != "OK" or not data or not data[0]:
             return []
 
         ids = data[0].split() if data and data[0] else []
         if not ids:
             return []
-
-        # 倒序后取前 limit 封
         recent_ids = ids[-limit:][::-1]
 
+        # 优化：列表阶段只批量拉取邮件头（BODY.PEEK[HEADER]），一次网络往返拿全部，
+        # 避免逐封拉取完整 RFC822（含附件）带来的多轮往返与带宽浪费；
+        # 正文在打开单封邮件时（load_single_mail_with_protocol）再按需拉取。
+        ids_csv = b",".join(recent_ids).decode()
+        try:
+            status, chunks = mail.fetch(ids_csv, "(BODY.PEEK[HEADER])")
+        except imaplib.IMAP4.abort:
+            return []
+        if status != "OK" or not chunks:
+            return []
+
         items: list[dict] = []
-        for mail_id in recent_ids:
-            status, fetched = mail.fetch(mail_id, "(RFC822)")
-            if status != "OK" or not fetched or not fetched[0]:
+        for item in chunks:
+            # fetch 多封时返回结构为 [(b'N FETCH (...)', bytes), b')', ...]，
+            # 仅处理含正文数据的元组
+            if not isinstance(item, tuple) or len(item) != 2:
                 continue
             try:
-                raw = fetched[0][1]
-                msg = email_lib.message_from_bytes(raw)
-                items.append(_parse_imap_message(msg))
+                msg = email_lib.message_from_bytes(item[1])
+                parsed = _parse_imap_message(msg)
+                # 列表不返回正文，减小体积；单封取件时才拉完整正文
+                parsed["body"] = ""
+                items.append(parsed)
             except Exception:
                 continue
 
@@ -1213,16 +1338,66 @@ def load_single_mail_with_protocol(
     effective_protocol = last_used if protocol == "auto" and last_used else protocol
     if effective_protocol == "graph":
         return load_single_mail(account, db, mail_id=mail_id, folder=folder)
-    # IMAP / POP3 在列表里已经返回完整正文，按 id 找回
+    # IMAP / POP3 按 id（Message-ID）精准定位单封，避免为取一封邮件而重新拉取整个列表
     # 按实际生效协议显式分发，避免 auto 模式被错误退化为 Graph
     if effective_protocol == "imap":
-        items = load_imap_messages(account, db, folder=folder, limit=50)
-    elif effective_protocol == "pop3":
+        return _load_single_imap_mail(account, db, mail_id, folder)
+    if effective_protocol == "pop3":
+        # POP3 不支持按 Message-ID 检索，仍需遍历；列表已含正文，直接匹配返回
         items = load_pop3_messages(account, db, folder=folder, limit=50)
-    else:
-        # auto 模式：交给自动选择逻辑，按 last_used_protocol 优先尝试
-        items = load_account_mails(account, db, folder=folder, limit=50)
+        for item in items or []:
+            if item.get("id") == mail_id:
+                return item
+        return None
+    # auto 模式：交给自动选择逻辑，按 last_used_protocol 优先尝试
+    items = load_account_mails(account, db, folder=folder, limit=50)
     for item in items or []:
         if item.get("id") == mail_id:
             return item
     return None
+
+
+def _load_single_imap_mail(
+    account: MailAccount, db: Session, mail_id: str, folder: str
+) -> dict | None:
+    """按 Message-ID 定位并拉取单封 IMAP 邮件的完整正文。
+
+    通过 `UID SEARCH HEADER Message-ID` 精确定位，再拉取该封的完整 RFC822，
+    避免为取一封邮件而重新拉取整个列表（原先要重载 50 封再按 id 匹配）。
+    """
+    mail = get_imap_conn(account, db)
+    try:
+        target_folder = _select_imap_folder(mail, folder)
+        try:
+            mail.select(target_folder, readonly=True)
+        except imaplib.IMAP4.abort:
+            return None
+
+        try:
+            status, data = mail.uid("search", None, "HEADER", "Message-ID", mail_id)
+        except imaplib.IMAP4.abort:
+            return None
+        if status != "OK" or not data or not data[0]:
+            return None
+        uids = data[0].split()
+        if not uids:
+            return None
+
+        uid = uids[0]
+        try:
+            status, fetched = mail.uid("fetch", uid, "(RFC822)")
+        except imaplib.IMAP4.abort:
+            return None
+        if status != "OK" or not fetched or not fetched[0] or not fetched[0][1]:
+            return None
+        try:
+            msg = email_lib.message_from_bytes(fetched[0][1])
+            return _parse_imap_message(msg)
+        except Exception:
+            return None
+    finally:
+        try:
+            mail.logout()
+        except Exception:
+            pass
+

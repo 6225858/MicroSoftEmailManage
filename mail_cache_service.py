@@ -181,15 +181,22 @@ def refresh_mail_cache_async(
     folder: str,
     limit: int = 20,
     force: bool = False,
+    incremental: bool = True,
 ) -> "RefreshTask":
     """
     后台异步刷新邮件缓存（不阻塞用户请求）。
     同一 (account_id, folder) 的并发刷新会去重：复用同一个 RefreshTask。
     force=True 时强制启动新任务（取消旧的）。
+    incremental=True 且已有缓存时，只对新邮件取正文、复用已缓存邮件，刷新更快。
     返回 RefreshTask，调用方可 .event.wait(timeout=N) 等待完成。
     """
     from database import SessionLocal
-    from mail_service import load_account_mails, MailServiceError, safe_mail_error_tag
+    from mail_service import (
+        load_account_mails,
+        merge_incremental_mails,
+        MailServiceError,
+        safe_mail_error_tag,
+    )
     from models import MailAccount
 
     key = (account_id, folder)
@@ -231,7 +238,35 @@ def refresh_mail_cache_async(
                 if not account:
                     error_msg = "account not found"
                 else:
-                    items = load_account_mails(account, db, folder=folder, limit=limit)
+                    # 已有缓存则走增量刷新（仅对新邮件取正文，复用已缓存邮件），否则全量取件
+                    items = None
+                    if incremental:
+                        try:
+                            existing = get_mail_cache(db, account_id, folder)
+                        except Exception as cache_exc:  # noqa: BLE001
+                            # 读取缓存异常不应中断刷新，回退全量取件
+                            logger.warning(
+                                "读取邮件缓存失败,回退全量取件 account=%d: %s",
+                                account_id, cache_exc,
+                            )
+                            existing = None
+                        if existing and existing.get("items"):
+                            try:
+                                items, new_count = merge_incremental_mails(
+                                    account, db, folder, limit, existing["items"]
+                                )
+                                logger.info(
+                                    "增量刷新邮件缓存: account=%d folder=%s 新增 %d 封 / 共 %d 封",
+                                    account_id, folder, new_count, len(items),
+                                )
+                            except Exception as inc_exc:  # noqa: BLE001
+                                logger.warning(
+                                    "增量刷新失败,回退全量取件 account=%d: %s",
+                                    account_id, inc_exc,
+                                )
+                                items = None
+                    if items is None:
+                        items = load_account_mails(account, db, folder=folder, limit=limit)
                     # 检查账号是否在取件过程中被删除
                     db.expire_all()
                     if not db.query(MailAccount).filter(MailAccount.id == account_id).first():

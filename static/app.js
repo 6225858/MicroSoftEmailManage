@@ -993,6 +993,51 @@ function renderAccountButtons(container, accounts, options) {
     }
 }
 
+// 仅同步账号卡片的选中高亮,避免全量重建 DOM 造成卡顿
+function syncAccountActiveState() {
+    [elements.accountList, elements.mailAccountList].forEach((container) => {
+        if (!container) {
+            return;
+        }
+        container.querySelectorAll(".account-item-shell").forEach((shell) => {
+            const idEl = shell.querySelector("[data-id]");
+            if (!idEl) {
+                return;
+            }
+            shell.classList.toggle("account-item-active", Number(idEl.dataset.id) === state.selectedAccountId);
+        });
+    });
+}
+
+// 局部更新某个账号在两个列表中的标签行与可见性,避免保存标签时全量重绘账号列表造成卡顿
+function syncAccountTagRows(accountId) {
+    const account = state.accounts.find((item) => item.id === accountId);
+    if (!account) {
+        return;
+    }
+    const accountMatch = getFilteredAccounts(elements.searchInput.value, elements.tagFilter.value)
+        .some((item) => item.id === accountId);
+    const mailMatch = getFilteredAccounts(elements.mailSearchInput.value, elements.mailTagFilter.value)
+        .some((item) => item.id === accountId);
+
+    const accountShell = elements.accountList.querySelector(`.account-item-shell[data-id="${accountId}"]`);
+    if (accountShell) {
+        const tagRow = accountShell.querySelector(".tag-row");
+        if (tagRow) {
+            tagRow.innerHTML = renderTagMarkup(account.tags, text.noTags, "tag", true);
+        }
+        accountShell.style.display = accountMatch ? "" : "none";
+    }
+    const mailShell = elements.mailAccountList.querySelector(`.account-item-shell[data-id="${accountId}"]`);
+    if (mailShell) {
+        const tagRow = mailShell.querySelector(".tag-row");
+        if (tagRow) {
+            tagRow.innerHTML = renderTagMarkup(account.tags, text.noTags, "tag", true);
+        }
+        mailShell.style.display = mailMatch ? "" : "none";
+    }
+}
+
 function renderAccounts() {
     const accountMatches = getFilteredAccounts(elements.searchInput.value, elements.tagFilter.value);
     const mailMatches = getFilteredAccounts(elements.mailSearchInput.value, elements.mailTagFilter.value);
@@ -2322,11 +2367,14 @@ async function persistTags(accountId, tags) {
     }
 
     updateTagFilterOptions();
+    syncAccountTagRows(accountId);
 
     if (state.selectedAccountId === accountId) {
-        updateSelectedAccountSummary();
-    } else {
-        renderAccounts();
+        const account = getSelectedAccount();
+        if (account) {
+            elements.tagsInput.value = account.tags;
+        }
+        syncAccountActiveState();
     }
 
     return data;
@@ -2745,6 +2793,15 @@ elements.tagModalCurrentTags.addEventListener("click", (event) => {
     event.stopPropagation();
     removeTagFromAccount(state.tagModalAccountId, removeBtn.dataset.tag);
 });
+// 双击弹窗内“当前标签”本体（排除 × 按钮）也可直接删除该标签
+elements.tagModalCurrentTags.addEventListener("dblclick", (event) => {
+    const tagEl = event.target.closest(".tag[data-tag]");
+    if (!tagEl || event.target.closest(".tag-remove")) {
+        return;
+    }
+    event.stopPropagation();
+    removeTagFromAccount(state.tagModalAccountId, tagEl.dataset.tag);
+});
 // 点击账号卡片标签右上角的删除符号即可移除该标签（弹窗内的预览/当前标签不含 account 上下文，不触发）
 document.addEventListener("click", (event) => {
     const removeBtn = event.target.closest(".tag-remove[data-tag]");
@@ -2761,6 +2818,23 @@ document.addEventListener("click", (event) => {
     }
     event.stopPropagation();
     removeTagFromAccount(Number(idEl.dataset.id), removeBtn.dataset.tag);
+});
+// 双击账号卡片上的标签本体（排除 × 删除按钮）也可从标签集合中删除该标签
+document.addEventListener("dblclick", (event) => {
+    const tagEl = event.target.closest(".tag[data-tag]");
+    if (!tagEl || event.target.closest(".tag-remove")) {
+        return;
+    }
+    const shell = tagEl.closest(".account-item-shell");
+    if (!shell) {
+        return;
+    }
+    const idEl = shell.querySelector("[data-id]");
+    if (!idEl) {
+        return;
+    }
+    event.stopPropagation();
+    removeTagFromAccount(Number(idEl.dataset.id), tagEl.dataset.tag);
 });
 elements.searchInput.addEventListener("input", () => {
     // 切换搜索筛选时清除之前的选中

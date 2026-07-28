@@ -751,9 +751,10 @@ time,
 }
 
 .tag {
-    background: var(--surface-2);
-    color: var(--muted);
-    border: 1px solid var(--border);
+    background: var(--info-soft);
+    color: var(--info);
+    border: 1px solid rgba(130, 80, 223, 0.35);
+    box-shadow: 0 1px 2px rgba(130, 80, 223, 0.12);
 }
 
 /* 账号卡片上可双击移除的标签 */
@@ -761,7 +762,12 @@ time,
     position: relative;
     padding-right: 14px;
     cursor: pointer;
-    transition: background-color 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+    transition: background-color 0.15s ease, color 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.tag[data-tag]:hover {
+    background: rgba(130, 80, 223, 0.18);
+    border-color: rgba(130, 80, 223, 0.55);
 }
 
 .tag-remove {

@@ -22,11 +22,14 @@ class TestLoadSingleMailWithProtocol(unittest.TestCase):
         with mock.patch.object(mail_service, "load_mail_messages"), \
              mock.patch.object(mail_service, "load_imap_messages") as im, \
              mock.patch.object(mail_service, "load_pop3_messages"), \
-             mock.patch.object(mail_service, "load_account_mails"):
-            im.return_value = [{"id": "m1"}]
+             mock.patch.object(mail_service, "load_account_mails"), \
+             mock.patch.object(mail_service, "_load_single_imap_mail") as sim:
+            sim.return_value = {"id": "m1"}
             res = mail_service.load_single_mail_with_protocol(acct, None, "m1", "inbox")
             self.assertIsNotNone(res)
-            mail_service.load_imap_messages.assert_called_once()
+            # IMAP 单封取件应直接按 Message-ID 定位，而非重新拉取整个列表
+            mail_service._load_single_imap_mail.assert_called_once()
+            mail_service.load_imap_messages.assert_not_called()
             mail_service.load_mail_messages.assert_not_called()
             mail_service.load_pop3_messages.assert_not_called()
             mail_service.load_account_mails.assert_not_called()

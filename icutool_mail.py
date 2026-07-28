@@ -52,7 +52,7 @@ from chatgpt_automation_service import (
 logger = logging.getLogger("icutool_mail")
 
 # ── 应用版本 & 配置 ──────────────────────────────────────
-APP_VERSION = "1.3.5"
+APP_VERSION = "1.3.6"
 DEFAULT_GITHUB_REPO = "6225858/MicroSoftEmailManage"
 SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
 
@@ -1511,6 +1511,15 @@ def get_mails_by_tag(
     }
 
 
+def _list_items_view(cached: dict | None) -> list[dict]:
+    """列表接口只返回邮件元数据,不携带正文(正文走详情接口),避免大体积正文反复传输。"""
+    items = (cached or {}).get("items") or []
+    return [
+        {k: v for k, v in item.items() if k not in ("body", "html")}
+        for item in items
+    ]
+
+
 @app.get("/api/accounts/{account_id}/mails", dependencies=[Depends(require_api_key)])
 def get_account_mails(
     account_id: int,
@@ -1544,7 +1553,7 @@ def get_account_mails(
                 cached = cached_after
                 refreshed_at = cached_after["updated_at"]
             return {
-                "items": cached["items"],
+                "items": _list_items_view(cached),
                 "cached": True,
                 "updated_at": refreshed_at,
                 "is_fresh": cached["is_fresh"],
@@ -1554,7 +1563,7 @@ def get_account_mails(
         # 不等待，立即返回缓存（与旧行为一致）
         # 后台刷新完成后，调用方可通过下一次请求拿到新数据
         return {
-            "items": cached["items"],
+            "items": _list_items_view(cached),
             "cached": True,
             "updated_at": cached["updated_at"],
             "is_fresh": cached["is_fresh"],
@@ -1573,7 +1582,7 @@ def get_account_mails(
         cached_after = get_mail_cache(db, account_id, folder)
         if cached_after and cached_after["items"]:
             return {
-                "items": cached_after["items"],
+                "items": _list_items_view(cached_after),
                 "cached": True,
                 "updated_at": cached_after["updated_at"],
                 "is_fresh": cached_after["is_fresh"],
@@ -1704,9 +1713,37 @@ def get_account_mail_detail(
         raise HTTPException(status_code=404, detail="account not found")
 
     try:
+        # 1. 优先命中缓存中已拉取过正文的邮件，避免重复网络取件（已获取邮件一直保留在缓存中）
+        cached = get_mail_cache(db, account_id, folder)
+        if cached and cached.get("items"):
+            for item in cached["items"]:
+                if item.get("id") == mail_id and (item.get("body") or "").strip():
+                    return item
+
+        # 2. 缓存未命中（或正文尚未拉取）→ 网络取件
         mail_detail = load_single_mail_with_protocol(account, db, mail_id=mail_id, folder=folder)
         if mail_detail is None:
             raise HTTPException(status_code=404, detail="mail not found")
+
+        # 3. 把刚取到的正文写回缓存，使后续打开该邮件可秒出（增量刷新也会复用这条缓存）
+        if cached and cached.get("items"):
+            updated = False
+            for item in cached["items"]:
+                if item.get("id") == mail_id:
+                    item["body"] = mail_detail.get("body", "")
+                    item["html"] = mail_detail.get("html", item.get("html"))
+                    item["attachments"] = mail_detail.get("attachments", item.get("attachments"))
+                    updated = True
+                    break
+            if updated:
+                try:
+                    # save_mail_cache 仅接受 (db, account_id, folder, mails) 四个参数，
+                    # mail_count/updated_at 由函数自行计算，is_fresh 由 TTL 重新推导，无需在此传入
+                    save_mail_cache(db, account_id, folder, cached["items"])
+                except Exception as cache_exc:  # noqa: BLE001
+                    logger.warning("写回邮件正文缓存失败 account=%d mail=%s: %s",
+                                   account_id, mail_id, cache_exc)
+
         return mail_detail
     except MailServiceError as exc:
         raise HTTPException(status_code=400, detail=exc.message)
