@@ -31,6 +31,7 @@ from mail_cache_service import (
     wait_for_refresh,
     is_refreshing,
     cancel_refresh_for_account,
+    get_last_refresh_result,
     _refresh_tasks,
 )
 from models import ApiKey, ChatgptEmailClaim, MailAccount, MailCache, Proxy, TokenRefreshLog
@@ -477,10 +478,6 @@ def claim_chatgpt_email(db: Session = Depends(get_db)):
         raise _automation_http_error(exc) from exc
 
 
-@app.post(
-    "/api/automation/chatgpt/verification-code",
-    dependencies=[Depends(require_automation_api_key)],
-)
 def _find_chatgpt_code_for_account(db, account, not_before_ms):
     """刷新并检索指定账号的最新 ChatGPT 验证码（同时检查收件箱与垃圾邮件）。"""
     folders = ("inbox", "junk")
@@ -758,7 +755,7 @@ def _fetch_mails_by_email(
         "items": items,
         "count": len(items),
         "cached": cached is not None,
-        "is_fresh": True,
+        "is_fresh": bool(cached and cached.get("is_fresh")),
         "updated_at": cached["updated_at"] if cached else int(time.time()),
         "refresh_ok": refresh_ok,
         "refresh_error": refresh_error,
@@ -910,6 +907,13 @@ def _poll_async_task(task_id: str, db: Session) -> dict:
         return {"task_id": task_id, "email": email, "folder": folder, "status": "pending"}
     cached = get_mail_cache(db, account_id, folder)
     items = cached["items"] if cached else []
+    # 任务可能已从 _refresh_tasks 出队（worker 完成后清理），此时从持久结果读取错误，
+    # 避免失败的异步刷新被误报为成功。
+    if task is not None:
+        refresh_error = task.error
+    else:
+        last = get_last_refresh_result(account_id, folder)
+        refresh_error = last.get("error") if last else None
     result = {
         "task_id": task_id,
         "email": email,
@@ -919,7 +923,7 @@ def _poll_async_task(task_id: str, db: Session) -> dict:
         "count": len(items),
         "updated_at": cached["updated_at"] if cached else None,
         "is_fresh": cached["is_fresh"] if cached else False,
-        "refresh_error": task.error if task is not None else None,
+        "refresh_error": refresh_error,
     }
     _async_tasks.pop(task_id, None)
     return result

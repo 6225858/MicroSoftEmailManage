@@ -25,6 +25,11 @@ CACHE_TTL = 300  # 5 分钟
 _refresh_tasks: dict[tuple[int, str], "RefreshTask"] = {}
 _refresh_lock = threading.Lock()
 
+# 最近一次刷新的结果（含 error）。worker 完成后会从 _refresh_tasks 出队，
+# 但异步任务轮询仍需要读到结果（尤其失败时的 error），因此单独持久保存。
+# 键为 (account_id, folder)，天然按账号+文件夹去重，数量有限，无需额外清理。
+_refresh_last_result: dict[tuple[int, str], dict] = {}
+
 # 后台刷新看门狗：若单次刷新超过该秒数仍未完成（如网络卡死），强制将刷新任务标记为结束，
 # 避免 is_refreshing 永远为 True 导致前端一直显示"正在拉取最新邮件"。
 REFRESH_WATCHDOG_SECONDS = 90
@@ -148,6 +153,15 @@ def get_active_refresh(account_id: int, folder: str) -> Optional["RefreshTask"]:
         return _refresh_tasks.get(key)
 
 
+def get_last_refresh_result(account_id: int, folder: str) -> Optional[dict]:
+    """
+    获取 (account_id, folder) 最近一次后台刷新的结果（含 error）。
+    与 get_active_refresh 不同：任务已完成后会从 _refresh_tasks 出队，
+    此函数仍能读到该次刷新的结果，用于异步任务轮询上报错误。
+    """
+    return _refresh_last_result.get((account_id, folder))
+
+
 def wait_for_refresh(account_id: int, folder: str, timeout: float = 30.0) -> Optional["RefreshTask"]:
     """
     等待 (account_id, folder) 的后台刷新完成。
@@ -252,6 +266,12 @@ def refresh_mail_cache_async(
             watchdog.cancel()
             task.done(error=error_msg, item_count=item_count)
             with _refresh_lock:
+                # 持久保存最近一次结果（含错误），供任务出队后轮询仍可读到
+                _refresh_last_result[key] = {
+                    "error": error_msg,
+                    "item_count": item_count,
+                    "ts": time.time(),
+                }
                 # 只有当前注册的还是我们的 task 时才清理
                 if _refresh_tasks.get(key) is task:
                     _refresh_tasks.pop(key, None)
