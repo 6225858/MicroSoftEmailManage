@@ -271,6 +271,7 @@ const elements = {
     tagFilter: document.getElementById("tag-filter"),
     selectedRemark: document.getElementById("selected-remark"),
     selectedEmail: document.getElementById("selected-email"),
+    mailPanelTitle: document.getElementById("mail-panel-title"),
     remarkModal: document.getElementById("remark-modal"),
     remarkModalBackdrop: document.getElementById("remark-modal-backdrop"),
     remarkModalCancelBtn: document.getElementById("remark-modal-cancel-btn"),
@@ -296,6 +297,9 @@ const elements = {
     mailAccountRemark: document.getElementById("mail-account-remark"),
     toggleAutoRefreshBtn: document.getElementById("toggle-auto-refresh-btn"),
     forceRefreshMailsBtn: document.getElementById("force-refresh-mails-btn"),
+    byEmailInput: document.getElementById("by-email-input"),
+    byEmailFolder: document.getElementById("by-email-folder"),
+    byEmailFetchBtn: document.getElementById("by-email-fetch-btn"),
     viewPanels: Array.from(document.querySelectorAll(".view-panel")),
     viewTitle: document.getElementById("view-title"),
     apiKeyNameInput: document.getElementById("api-key-name-input"),
@@ -342,7 +346,7 @@ const text = {
     mailsTitle: "邮件查看",
     noMatchingAccounts: "暂无符合条件的邮箱账号",
     noTags: "暂无标签",
-    dblclickToRemoveTag: "双击移除该标签",
+    removeTag: "删除该标签",
     accountCount: (count) => `${count} 个账号`,
     visibleAccountCount: (visible, total) => `当前显示 ${visible} / 总计 ${total} 个邮箱`,
     chooseMailList: "请选择一个邮箱账号后查看邮件",
@@ -601,10 +605,11 @@ function renderTagMarkup(value, emptyText = text.noTags, className = "tag", inte
     }
 
     return tags.map((tag) => {
-        const attr = interactive
-            ? ` data-tag="${escapeHtml(tag)}" title="${escapeHtml(text.dblclickToRemoveTag)}"`
-            : "";
-        return `<span class="${className}"${attr}>${escapeHtml(tag)}</span>`;
+        const inner = interactive
+            ? `${escapeHtml(tag)}<button type="button" class="tag-remove" data-tag="${escapeHtml(tag)}" aria-label="${escapeHtml(text.removeTag)}">×</button>`
+            : escapeHtml(tag);
+        const attr = interactive ? ` data-tag="${escapeHtml(tag)}"` : "";
+        return `<span class="${className}"${attr}>${inner}</span>`;
     }).join("");
 }
 
@@ -1735,6 +1740,48 @@ function updateMailsFromData(data, accountId, folder) {
     renderMails();
 }
 
+// 按邮箱地址定向取件（指向性取号）：输入邮箱 -> 定位账号 -> 强制刷新并收取邮件
+async function fetchMailsByEmail() {
+    const email = (elements.byEmailInput.value || "").trim();
+    if (!email) {
+        setMessage(elements.mailMessage, "请输入要定向取件的邮箱地址", true);
+        return;
+    }
+    const folder = elements.byEmailFolder ? (elements.byEmailFolder.value || "inbox") : "inbox";
+    setMessage(elements.mailMessage, `正在向 ${email} 收取最新邮件...`, false);
+    resetMailView({ listText: text.loadingMails, detailText: text.loadingMails });
+    elements.byEmailFetchBtn.disabled = true;
+    try {
+        const params = new URLSearchParams({ email, folder });
+        const data = await api(`/api/mails/by-email?${params}`);
+        state.selectedAccountId = null;
+        updateSelectedAccountSummary();
+        state.activeFolder = folder;
+        updateMailsFromData(data, data.account_id, folder);
+        if (elements.mailPanelTitle) {
+            elements.mailPanelTitle.textContent = `定向取件：${data.email}`;
+        }
+        if (data.refresh_error) {
+            setMessage(
+                elements.mailMessage,
+                `定向取件「${email}」已返回，但拉取邮箱时发生异常：${data.refresh_error}`,
+                true
+            );
+        } else {
+            setMessage(
+                elements.mailMessage,
+                `已定向取件「${email}」：${data.count} 封邮件（更新于 ${formatDateTime(data.updated_at)}）`,
+                false
+            );
+        }
+        updateMailMobileView();
+    } catch (error) {
+        setMessage(elements.mailMessage, error.message, true);
+    } finally {
+        elements.byEmailFetchBtn.disabled = false;
+    }
+}
+
 // 等待后台刷新完成并刷新视图
 async function fetchMailsWithWait({ silent, requestId, accountId, folder }) {
     try {
@@ -2415,6 +2462,12 @@ elements.copyMailAddressBtn.addEventListener("click", copySelectedEmailAddress);
 elements.toggleAutoRefreshBtn.addEventListener("click", toggleAutoRefresh);
 if (elements.forceRefreshMailsBtn) {
     elements.forceRefreshMailsBtn.addEventListener("click", forceRefreshMails);
+    elements.byEmailFetchBtn.addEventListener("click", fetchMailsByEmail);
+    elements.byEmailInput.addEventListener("keydown", (event) => {
+        if (event.key === "Enter") {
+            fetchMailsByEmail();
+        }
+    });
 }
 elements.remarkModalBackdrop.addEventListener("click", closeRemarkModal);
 elements.remarkModalCancelBtn.addEventListener("click", closeRemarkModal);
@@ -2432,13 +2485,13 @@ elements.tagModalSuggestions.addEventListener("click", (event) => {
     applyQuickTag(button.dataset.tag);
 });
 elements.tagModalSaveBtn.addEventListener("click", saveTagModalTags);
-// 双击账号卡片上的标签即可移除该标签（弹窗内的预览/当前标签不含 account 上下文，不触发）
-document.addEventListener("dblclick", (event) => {
-    const tagSpan = event.target.closest(".tag[data-tag]");
-    if (!tagSpan) {
+// 点击账号卡片标签右上角的删除符号即可移除该标签（弹窗内的预览/当前标签不含 account 上下文，不触发）
+document.addEventListener("click", (event) => {
+    const removeBtn = event.target.closest(".tag-remove[data-tag]");
+    if (!removeBtn) {
         return;
     }
-    const shell = tagSpan.closest(".account-item-shell");
+    const shell = removeBtn.closest(".account-item-shell");
     if (!shell) {
         return;
     }
@@ -2446,7 +2499,8 @@ document.addEventListener("dblclick", (event) => {
     if (!idEl) {
         return;
     }
-    removeTagFromAccount(Number(idEl.dataset.id), tagSpan.dataset.tag);
+    event.stopPropagation();
+    removeTagFromAccount(Number(idEl.dataset.id), removeBtn.dataset.tag);
 });
 elements.searchInput.addEventListener("input", () => {
     // 切换搜索筛选时清除之前的选中

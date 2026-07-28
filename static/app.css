@@ -758,15 +758,35 @@ time,
 
 /* 账号卡片上可双击移除的标签 */
 .tag[data-tag] {
+    position: relative;
+    padding-right: 14px;
     cursor: pointer;
     transition: background-color 0.15s ease, color 0.15s ease, border-color 0.15s ease;
 }
 
-.tag[data-tag]:hover {
+.tag-remove {
+    position: absolute;
+    top: -5px;
+    right: -3px;
+    width: 14px;
+    height: 14px;
+    line-height: 12px;
+    text-align: center;
+    font-size: 12px;
+    border: none;
+    border-radius: 50%;
     background: var(--danger-soft, #fdecec);
     color: var(--danger, #e5484d);
-    border-color: var(--danger, #e5484d);
-    text-decoration: line-through;
+    cursor: pointer;
+    padding: 0;
+    opacity: 0.75;
+    transition: background 0.12s, color 0.12s, opacity 0.12s;
+}
+.tag[data-tag]:hover .tag-remove { opacity: 1; }
+.tag-remove:hover {
+    background: var(--danger, #e5484d);
+    color: #fff;
+    opacity: 1;
 }
 
 .proxy-warning-banner {
@@ -1739,6 +1759,21 @@ time,
     flex-wrap: wrap;
     align-items: center;
     gap: 10px;
+}
+
+.by-email-fetch {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    padding-top: 10px;
+    margin-top: 10px;
+    border-top: 1px dashed #2a3140;
+}
+
+.by-email-fetch .input {
+    flex: 1 1 240px;
+    min-width: 200px;
 }
 
 .mobile-mail-steps,

@@ -10,6 +10,9 @@ _server*.log
 _runserver.py
 _test_accounts.txt
 _maillist*.png
+_import_result.txt
+_test_result.txt
+_*.txt
 
 # 运行时生成的配置(含用户 GitHub 仓库地址等本地设置)
 settings.json

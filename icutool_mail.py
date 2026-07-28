@@ -14,8 +14,9 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from pathlib import Path
 from pydantic import BaseModel
-from sqlalchemy import or_
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from database import Base, SessionLocal, engine, DATABASE_PATH
@@ -46,7 +47,7 @@ from chatgpt_automation_service import (
 logger = logging.getLogger("icutool_mail")
 
 # ── 应用版本 & 配置 ──────────────────────────────────────
-APP_VERSION = "1.1.8"
+APP_VERSION = "1.2.0"
 DEFAULT_GITHUB_REPO = "6225858/MicroSoftEmailManage"
 SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
 
@@ -196,6 +197,13 @@ class ChatgptVerificationCodeBody(ChatgptClaimTokenBody):
 
 class ChatgptReconcileBody(ChatgptClaimTokenBody):
     email: str
+
+
+class ByEmailMailBody(BaseModel):
+    email: str
+    folder: str = "inbox"
+    limit: int = 20
+    force: bool = True
 
 
 AUTOMATION_CACHE_REFRESH_COOLDOWN_SECONDS = 10
@@ -435,8 +443,12 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Hotmail Mail Manager", lifespan=lifespan)
-app.mount("/static", StaticFiles(directory="static"), name="static")
-templates = Jinja2Templates(directory="templates")
+# 使用基于模块文件的绝对路径，避免 Docker 等场景下工作目录(cwd)非项目根导致
+# StaticFiles / Jinja2Templates 找不到目录（本地 _runserver.py 会 chdir，但 Docker 的
+# uvicorn CMD 不保证 cwd 为 /app，相对路径会失效导致静态资源/页面无法加载）。
+_BASE_DIR = Path(__file__).resolve().parent
+app.mount("/static", StaticFiles(directory=str(_BASE_DIR / "static")), name="static")
+templates = Jinja2Templates(directory=str(_BASE_DIR / "templates"))
 
 
 def _automation_http_error(exc: AutomationError) -> HTTPException:
@@ -557,9 +569,76 @@ def release_chatgpt_claim(
     return {"ok": True, "released": released}
 
 
+def _fetch_mails_by_email(db: Session, email: str, folder: str, limit: int, force: bool, timeout: int) -> dict:
+    """按邮箱地址定位对应账号并强制刷新收取最新邮件（指向性取号）。"""
+    normalized = (email or "").strip().casefold()
+    if not normalized:
+        raise HTTPException(status_code=400, detail={"code": "invalid_email", "message": "email 不能为空"})
+    account = (
+        db.query(MailAccount)
+        .filter(func.lower(MailAccount.email) == normalized)
+        .first()
+    )
+    if account is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "account_not_found", "message": f"未找到匹配邮箱: {email}"},
+        )
+
+    folder = (folder or "inbox").strip() or "inbox"
+    if folder not in ("inbox", "junk"):
+        folder = "inbox"
+    limit = max(1, min(int(limit or 20), 100))
+
+    ok, err = refresh_mail_cache_sync(account.id, folder, limit, timeout=timeout, db=db)
+    db.expire_all()
+    cached = get_mail_cache(db, account.id, folder)
+    items = cached["items"] if cached else []
+    return {
+        "account_id": account.id,
+        "email": account.email,
+        "folder": folder,
+        "items": items,
+        "count": len(items),
+        "cached": cached is not None,
+        "is_fresh": True,
+        "updated_at": cached["updated_at"] if cached else int(time.time()),
+        "refresh_ok": ok,
+        "refresh_error": err,
+    }
+
+
+@app.post(
+    "/api/automation/mails/by-email",
+    dependencies=[Depends(require_automation_api_key)],
+)
+def get_mails_by_email_automation(
+    body: ByEmailMailBody,
+    db: Session = Depends(get_db),
+):
+    return _fetch_mails_by_email(db, body.email, body.folder, body.limit, body.force, timeout=55)
+
+
+@app.get("/api/mails/by-email", dependencies=[Depends(require_api_key)])
+def get_mails_by_email_local(
+    email: str = Query(...),
+    folder: str = Query("inbox"),
+    limit: int = Query(20),
+    force: bool = Query(True),
+    db: Session = Depends(get_db),
+):
+    return _fetch_mails_by_email(db, email, folder, limit, force, timeout=28)
+
+
 @app.get("/", response_class=HTMLResponse)
 def index_page(request: Request):
-    return templates.TemplateResponse(request=request, name="index.html", context={})
+    # 用 APP_VERSION 作为静态资源缓存破坏参数,确保一键更新(版本号变化时)浏览器
+    # 强制重新加载最新的 app.js / app.css,避免旧缓存 JS 与新后端不兼容导致页面无反应。
+    return templates.TemplateResponse(
+        request=request,
+        name="index.html",
+        context={"static_ver": APP_VERSION},
+    )
 
 
 @app.get("/dashboard", response_class=HTMLResponse)
@@ -1712,6 +1791,14 @@ def perform_update():
 
             # ── 阶段 4: 备份本地数据 ──
             yield _emit("backing_up", "正在备份本地数据（settings.json / mail.db / data/）…", 75)
+            # 先把 SQLite 的 WAL 数据合并回主库,确保备份的 mail.db 是最新的,
+            # 否则数据可能还在 -wal 文件里未落盘,覆盖/恢复后造成账号"丢失"的假象。
+            try:
+                from database import engine
+                with engine.connect() as _conn:
+                    _conn.exec_driver_sql("PRAGMA wal_checkpoint(TRUNCATE)")
+            except Exception as _exc:
+                logger.warning("WAL checkpoint 失败(可忽略): %s", _exc)
             backups = {}
             backup_dir = tempfile.mkdtemp(prefix="mse_backup_", dir=PROJECT_ROOT)
             for fname in PRESERVE_FILES:

@@ -7,7 +7,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="/static/app.css?v=20">
+    <link rel="stylesheet" href="/static/app.css?v={{ static_ver }}">
 </head>
 <body>
     <div class="page-shell app-shell">
@@ -221,6 +221,14 @@
                                 </div>
                                 <button id="copy-mail-address-btn" class="button button-ghost" type="button">复制邮箱地址</button>
                                 <button id="force-refresh-mails-btn" class="button button-ghost" type="button" disabled>立即刷新</button>
+                            </div>
+                            <div class="by-email-fetch">
+                                <input id="by-email-input" class="input" type="text" placeholder="输入邮箱定向取件（指向性取号）" autocomplete="off">
+                                <select id="by-email-folder" class="input filter-select">
+                                    <option value="inbox">收件箱</option>
+                                    <option value="junk">垃圾邮件</option>
+                                </select>
+                                <button id="by-email-fetch-btn" class="button" type="button">定向取件</button>
                             </div>
                         </div>
 
@@ -688,6 +696,6 @@
         </section>
     </div>
 
-    <script src="/static/app.js?v=20"></script>
+    <script src="/static/app.js?v={{ static_ver }}"></script>
 </body>
 </html>
