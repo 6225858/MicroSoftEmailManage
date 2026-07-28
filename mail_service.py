@@ -626,14 +626,19 @@ def load_account_mails_with_protocol(
     folder: str = "inbox",
     limit: int = 20,
 ) -> list[dict]:
-    """根据账号 protocol 选择对应取件方式。"""
-    protocol = getattr(account, "protocol", None) or "graph"
-    protocol = protocol.lower().strip()
+    """根据账号 protocol 选择对应取件方式。
+    protocol='auto' 时委托给自动选择逻辑（按 last_used_protocol 优先），
+    避免把 auto 当成缺失而退化为 Graph；其余按指定协议取件。
+    """
+    protocol = (getattr(account, "protocol", None) or "auto").lower().strip()
 
+    if protocol == "auto":
+        return load_account_mails(account, db, folder=folder, limit=limit)
     if protocol == "imap":
         return load_imap_messages(account, db, folder=folder, limit=limit)
     if protocol == "pop3":
         return load_pop3_messages(account, db, folder=folder, limit=limit)
+    # 未知 / 显式 graph 协议统一走 Graph
     return load_mail_messages(account, db, folder=folder, limit=limit)
 
 
@@ -1209,8 +1214,15 @@ def load_single_mail_with_protocol(
     if effective_protocol == "graph":
         return load_single_mail(account, db, mail_id=mail_id, folder=folder)
     # IMAP / POP3 在列表里已经返回完整正文，按 id 找回
-    items = load_account_mails_with_protocol(account, db, folder=folder, limit=50)
-    for item in items:
+    # 按实际生效协议显式分发，避免 auto 模式被错误退化为 Graph
+    if effective_protocol == "imap":
+        items = load_imap_messages(account, db, folder=folder, limit=50)
+    elif effective_protocol == "pop3":
+        items = load_pop3_messages(account, db, folder=folder, limit=50)
+    else:
+        # auto 模式：交给自动选择逻辑，按 last_used_protocol 优先尝试
+        items = load_account_mails(account, db, folder=folder, limit=50)
+    for item in items or []:
         if item.get("id") == mail_id:
             return item
     return None
