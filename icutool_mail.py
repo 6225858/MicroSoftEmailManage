@@ -1,10 +1,12 @@
 import secrets
 import time
+import uuid
+import re
 import logging
 import json
 import os
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from urllib.parse import quote
 
@@ -29,6 +31,7 @@ from mail_cache_service import (
     wait_for_refresh,
     is_refreshing,
     cancel_refresh_for_account,
+    _refresh_tasks,
 )
 from models import ApiKey, ChatgptEmailClaim, MailAccount, MailCache, Proxy, TokenRefreshLog
 from oauth_service import OAuthServiceError, get_valid_access_token
@@ -36,6 +39,7 @@ from proxy_service import import_proxy_line, test_proxies_status
 from chatgpt_automation_service import (
     AutomationError,
     claim_email,
+    claim_email_by_address,
     complete_claim,
     find_latest_chatgpt_code,
     reconcile_claim_registration,
@@ -47,7 +51,7 @@ from chatgpt_automation_service import (
 logger = logging.getLogger("icutool_mail")
 
 # ── 应用版本 & 配置 ──────────────────────────────────────
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 DEFAULT_GITHUB_REPO = "6225858/MicroSoftEmailManage"
 SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
 
@@ -204,6 +208,10 @@ class ByEmailMailBody(BaseModel):
     folder: str = "inbox"
     limit: int = 20
     force: bool = True
+    since: int = 0
+    unseen_only: bool = False
+    extract_code: bool = False
+    code_since_ms: int = 0
 
 
 AUTOMATION_CACHE_REFRESH_COOLDOWN_SECONDS = 10
@@ -473,15 +481,8 @@ def claim_chatgpt_email(db: Session = Depends(get_db)):
     "/api/automation/chatgpt/verification-code",
     dependencies=[Depends(require_automation_api_key)],
 )
-def get_chatgpt_verification_code(
-    body: ChatgptVerificationCodeBody,
-    db: Session = Depends(get_db),
-):
-    try:
-        claim, account = resolve_active_claim(db, body.claim_token)
-    except AutomationError as exc:
-        raise _automation_http_error(exc) from exc
-
+def _find_chatgpt_code_for_account(db, account, not_before_ms):
+    """刷新并检索指定账号的最新 ChatGPT 验证码（同时检查收件箱与垃圾邮件）。"""
     folders = ("inbox", "junk")
     caches = {folder: get_mail_cache(db, account.id, folder) for folder in folders}
     cache_now = int(time.time())
@@ -493,9 +494,8 @@ def get_chatgpt_verification_code(
     match = find_latest_chatgpt_code(
         {folder: (cache or {}).get("items", []) for folder, cache in caches.items()},
         account.email,
-        body.not_before,
+        not_before_ms,
     )
-
     if match is None and tasks:
         deadline = time.monotonic() + 10
         for task in tasks.values():
@@ -505,24 +505,94 @@ def get_chatgpt_verification_code(
         match = find_latest_chatgpt_code(
             {folder: (cache or {}).get("items", []) for folder, cache in caches.items()},
             account.email,
-            body.not_before,
+            not_before_ms,
         )
-        unavailable_folders = [
-            folder
-            for folder in folders
-            if not caches[folder]
-            and folder in tasks
-            and tasks[folder].error
-        ]
-        if match is None and len(unavailable_folders) == len(folders):
-            raise HTTPException(status_code=502, detail={
-                "code": "mail_fetch_failed",
-                "message": "Unable to refresh mailbox",
-            })
+    return match, caches, tasks
+
+
+@app.post(
+    "/api/automation/chatgpt/verification-code",
+    dependencies=[Depends(require_automation_api_key)],
+)
+def get_chatgpt_verification_code(
+    body: ChatgptVerificationCodeBody,
+    db: Session = Depends(get_db),
+):
+    try:
+        claim, account = resolve_active_claim(db, body.claim_token)
+    except AutomationError as exc:
+        raise _automation_http_error(exc) from exc
+
+    match, caches, tasks = _find_chatgpt_code_for_account(db, account, body.not_before)
+    unavailable_folders = [
+        folder
+        for folder in ("inbox", "junk")
+        if not caches[folder] and folder in tasks and tasks[folder].error
+    ]
+    if match is None and len(unavailable_folders) == len(("inbox", "junk")):
+        raise HTTPException(status_code=502, detail={
+            "code": "mail_fetch_failed",
+            "message": "Unable to refresh mailbox",
+        })
     try:
         renew_claim(db, claim, code_found=bool(match))
     except AutomationError as exc:
         raise _automation_http_error(exc) from exc
+    return match or {"code": "", "received_at": "", "folder": ""}
+
+
+class ByEmailClaimBody(BaseModel):
+    email: str
+
+
+@app.post(
+    "/api/automation/claim/by-email",
+    dependencies=[Depends(require_automation_api_key)],
+)
+def claim_email_by_email(body: ByEmailClaimBody, db: Session = Depends(get_db)):
+    try:
+        return claim_email_by_address(db, body.email)
+    except AutomationError as exc:
+        raise _automation_http_error(exc) from exc
+
+
+class ByEmailVerificationCodeBody(BaseModel):
+    email: str
+    not_before: int = 0
+    folder: str = "inbox"
+
+
+@app.post(
+    "/api/automation/by-email/verification-code",
+    dependencies=[Depends(require_automation_api_key)],
+)
+def get_chatgpt_code_by_email(body: ByEmailVerificationCodeBody, db: Session = Depends(get_db)):
+    normalized = (body.email or "").strip().casefold()
+    if not normalized:
+        raise HTTPException(status_code=400, detail={"code": "invalid_email", "message": "email 不能为空"})
+    account = (
+        db.query(MailAccount)
+        .filter(func.lower(MailAccount.email) == normalized)
+        .first()
+    )
+    if account is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "account_not_found", "message": f"未找到匹配邮箱: {body.email}"},
+        )
+    not_before = body.not_before or (int(time.time() * 1000) - 10 * 60 * 1000)
+    match, caches, tasks = _find_chatgpt_code_for_account(db, account, not_before)
+    if match is None:
+        unavailable_folders = [
+            folder
+            for folder in ("inbox", "junk")
+            if not caches[folder] and folder in tasks and tasks[folder].error
+        ]
+        if len(unavailable_folders) == len(("inbox", "junk")):
+            raise HTTPException(status_code=502, detail={
+                "code": "mail_fetch_failed",
+                "message": "Unable to refresh mailbox",
+            })
     return match or {"code": "", "received_at": "", "folder": ""}
 
 
@@ -569,8 +639,75 @@ def release_chatgpt_claim(
     return {"ok": True, "released": released}
 
 
-def _fetch_mails_by_email(db: Session, email: str, folder: str, limit: int, force: bool, timeout: int) -> dict:
-    """按邮箱地址定位对应账号并强制刷新收取最新邮件（指向性取号）。"""
+_SHANGHAI_TZ = timezone(timedelta(hours=8))
+_GENERIC_CODE_RE = re.compile(r"(?<!\d)(\d{4,8})(?!\d)")
+
+
+def _mail_dt_to_ts(mail_dt) -> Optional[int]:
+    """将邮件时间(上海时区 YYYY-MM-DD HH:MM:SS)转为 epoch 秒，失败返回 None。"""
+    if not isinstance(mail_dt, str):
+        return None
+    value = mail_dt.strip()
+    try:
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", value):
+            dt = datetime.strptime(value, "%Y-%m-%d %H:%M:%S").replace(tzinfo=_SHANGHAI_TZ)
+            return int(dt.timestamp())
+    except ValueError:
+        return None
+    return None
+
+
+def _is_read(item: dict) -> bool:
+    return bool(item.get("is_read"))
+
+
+def _filter_mail_items(items, since: int = 0, unseen_only: bool = False):
+    if not items:
+        return items
+    out = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        if unseen_only and _is_read(it):
+            continue
+        if since:
+            ts = _mail_dt_to_ts(it.get("mail_dt"))
+            if ts is not None and ts < since:
+                continue
+        out.append(it)
+    return out
+
+
+def _generic_codes(folder_mails: dict, limit: int = 5) -> list:
+    """从邮件主题/正文中尽力提取可能的验证码（4-8 位数字），用于 ChatGPT 码之外的兜底。"""
+    found = []
+    for mails in folder_mails.values():
+        for mail in mails or []:
+            if not isinstance(mail, dict):
+                continue
+            blob = f"{mail.get('subject') or ''} {mail.get('body') or ''}"
+            for m in _GENERIC_CODE_RE.finditer(blob):
+                code = m.group(1)
+                if code not in found:
+                    found.append(code)
+                if len(found) >= limit:
+                    return found
+    return found
+
+
+def _fetch_mails_by_email(
+    db: Session,
+    email: str,
+    folder: str,
+    limit: int,
+    force: bool,
+    timeout: int,
+    since: int = 0,
+    unseen_only: bool = False,
+    extract_code: bool = False,
+    code_since_ms: int = 0,
+) -> dict:
+    """按邮箱地址定位对应账号并刷新收取最新邮件（指向性取号）。"""
     normalized = (email or "").strip().casefold()
     if not normalized:
         raise HTTPException(status_code=400, detail={"code": "invalid_email", "message": "email 不能为空"})
@@ -590,11 +727,31 @@ def _fetch_mails_by_email(db: Session, email: str, folder: str, limit: int, forc
         folder = "inbox"
     limit = max(1, min(int(limit or 20), 100))
 
-    ok, err = refresh_mail_cache_sync(account.id, folder, limit, timeout=timeout, db=db)
+    # 提取验证码时同时检查收件箱与垃圾邮件
+    refresh_folders = ("inbox", "junk") if extract_code else (folder,)
+
+    # 缓存优先：force=False 且主文件夹缓存仍然新鲜则跳过刷新
+    need_refresh = force
+    if not need_refresh:
+        primary_cache = get_mail_cache(db, account.id, folder)
+        if not (primary_cache and primary_cache.get("is_fresh")):
+            need_refresh = True
+
+    refresh_ok = True
+    refresh_error = None
+    if need_refresh:
+        for f in refresh_folders:
+            ok, err = refresh_mail_cache_sync(account.id, f, limit, timeout=timeout, db=db)
+            if not ok:
+                refresh_ok = False
+                refresh_error = err
+
     db.expire_all()
     cached = get_mail_cache(db, account.id, folder)
     items = cached["items"] if cached else []
-    return {
+    items = _filter_mail_items(items, since=since, unseen_only=unseen_only)
+
+    result = {
         "account_id": account.id,
         "email": account.email,
         "folder": folder,
@@ -603,9 +760,23 @@ def _fetch_mails_by_email(db: Session, email: str, folder: str, limit: int, forc
         "cached": cached is not None,
         "is_fresh": True,
         "updated_at": cached["updated_at"] if cached else int(time.time()),
-        "refresh_ok": ok,
-        "refresh_error": err,
+        "refresh_ok": refresh_ok,
+        "refresh_error": refresh_error,
     }
+
+    if extract_code:
+        folder_mails = {}
+        for f in refresh_folders:
+            c = get_mail_cache(db, account.id, f)
+            folder_mails[f] = (c or {}).get("items", []) if c else []
+        not_before = code_since_ms or (int(time.time() * 1000) - 30 * 60 * 1000)
+        match = find_latest_chatgpt_code(folder_mails, account.email, not_before)
+        result["code"] = match["code"] if match else ""
+        result["code_received_at"] = match["received_at"] if match else ""
+        result["code_folder"] = match["folder"] if match else ""
+        result["possible_codes"] = _generic_codes(folder_mails)
+
+    return result
 
 
 @app.post(
@@ -616,7 +787,11 @@ def get_mails_by_email_automation(
     body: ByEmailMailBody,
     db: Session = Depends(get_db),
 ):
-    return _fetch_mails_by_email(db, body.email, body.folder, body.limit, body.force, timeout=55)
+    return _fetch_mails_by_email(
+        db, body.email, body.folder, body.limit, body.force, timeout=55,
+        since=body.since, unseen_only=body.unseen_only,
+        extract_code=body.extract_code, code_since_ms=body.code_since_ms,
+    )
 
 
 @app.get("/api/mails/by-email", dependencies=[Depends(require_api_key)])
@@ -625,9 +800,139 @@ def get_mails_by_email_local(
     folder: str = Query("inbox"),
     limit: int = Query(20),
     force: bool = Query(True),
+    since: int = Query(0),
+    unseen_only: bool = Query(False),
+    extract_code: bool = Query(False),
+    code_since_ms: int = Query(0),
     db: Session = Depends(get_db),
 ):
-    return _fetch_mails_by_email(db, email, folder, limit, force, timeout=28)
+    return _fetch_mails_by_email(
+        db, email, folder, limit, force, timeout=28,
+        since=since, unseen_only=unseen_only,
+        extract_code=extract_code, code_since_ms=code_since_ms,
+    )
+
+
+class ByEmailBatchBody(BaseModel):
+    emails: list[str]
+    folder: str = "inbox"
+    limit: int = 20
+    force: bool = True
+    since: int = 0
+    unseen_only: bool = False
+    extract_code: bool = False
+    code_since_ms: int = 0
+
+
+_MAX_BATCH_EMAILS = 50
+
+
+def _batch_fetch_mails_by_email(db: Session, body: ByEmailBatchBody) -> dict:
+    emails = [e for e in (body.emails or [])][: _MAX_BATCH_EMAILS]
+    results = []
+    for email in emails:
+        try:
+            results.append(_fetch_mails_by_email(
+                db, email, body.folder, body.limit, body.force, timeout=55,
+                since=body.since, unseen_only=body.unseen_only,
+                extract_code=body.extract_code, code_since_ms=body.code_since_ms,
+            ))
+        except HTTPException as exc:
+            detail = exc.detail if isinstance(exc.detail, dict) else {"message": str(exc.detail)}
+            results.append({"email": email, "error": detail, "status_code": exc.status_code})
+    return {"results": results, "total": len(emails), "returned": len(results)}
+
+
+@app.post("/api/automation/mails/batch-by-email", dependencies=[Depends(require_automation_api_key)])
+def get_mails_batch_by_email_automation(body: ByEmailBatchBody, db: Session = Depends(get_db)):
+    return _batch_fetch_mails_by_email(db, body)
+
+
+@app.post("/api/mails/batch-by-email", dependencies=[Depends(require_api_key)])
+def get_mails_batch_by_email_local(body: ByEmailBatchBody, db: Session = Depends(get_db)):
+    return _batch_fetch_mails_by_email(db, body)
+
+
+# 异步定向取件任务：task_id -> (account_id, folder, email)
+_async_tasks: dict[str, tuple[int, str, str]] = {}
+
+
+def _start_async_fetch(db: Session, body: ByEmailMailBody) -> dict:
+    normalized = (body.email or "").strip().casefold()
+    if not normalized:
+        raise HTTPException(status_code=400, detail={"code": "invalid_email", "message": "email 不能为空"})
+    account = (
+        db.query(MailAccount)
+        .filter(func.lower(MailAccount.email) == normalized)
+        .first()
+    )
+    if account is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "account_not_found", "message": f"未找到匹配邮箱: {body.email}"},
+        )
+    folder = (body.folder or "inbox").strip() or "inbox"
+    if folder not in ("inbox", "junk"):
+        folder = "inbox"
+    limit = max(1, min(int(body.limit or 20), 100))
+    refresh_mail_cache_async(account.id, folder, limit, force=True)
+    task_id = uuid.uuid4().hex
+    _async_tasks[task_id] = (account.id, folder, account.email)
+    return {
+        "task_id": task_id,
+        "account_id": account.id,
+        "email": account.email,
+        "folder": folder,
+        "status": "pending",
+    }
+
+
+@app.post("/api/automation/mails/async-fetch", dependencies=[Depends(require_automation_api_key)])
+def async_fetch_by_email_automation(body: ByEmailMailBody, db: Session = Depends(get_db)):
+    return _start_async_fetch(db, body)
+
+
+@app.post("/api/mails/async-fetch", dependencies=[Depends(require_api_key)])
+def async_fetch_by_email_local(body: ByEmailMailBody, db: Session = Depends(get_db)):
+    return _start_async_fetch(db, body)
+
+
+def _poll_async_task(task_id: str, db: Session) -> dict:
+    info = _async_tasks.get(task_id)
+    if info is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "task_not_found", "message": "任务不存在或已过期"},
+        )
+    account_id, folder, email = info
+    task = _refresh_tasks.get((account_id, folder))
+    if task is not None and not task.event.is_set():
+        return {"task_id": task_id, "email": email, "folder": folder, "status": "pending"}
+    cached = get_mail_cache(db, account_id, folder)
+    items = cached["items"] if cached else []
+    result = {
+        "task_id": task_id,
+        "email": email,
+        "folder": folder,
+        "status": "done",
+        "items": items,
+        "count": len(items),
+        "updated_at": cached["updated_at"] if cached else None,
+        "is_fresh": cached["is_fresh"] if cached else False,
+        "refresh_error": task.error if task is not None else None,
+    }
+    _async_tasks.pop(task_id, None)
+    return result
+
+
+@app.get("/api/automation/mails/task/{task_id}", dependencies=[Depends(require_automation_api_key)])
+def poll_task_automation(task_id: str, db: Session = Depends(get_db)):
+    return _poll_async_task(task_id, db)
+
+
+@app.get("/api/mails/task/{task_id}", dependencies=[Depends(require_api_key)])
+def poll_task_local(task_id: str, db: Session = Depends(get_db)):
+    return _poll_async_task(task_id, db)
 
 
 @app.get("/", response_class=HTMLResponse)

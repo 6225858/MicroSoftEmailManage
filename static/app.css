@@ -1776,6 +1776,45 @@ time,
     min-width: 200px;
 }
 
+.by-email-option {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 13px;
+    color: #8a93a6;
+    cursor: pointer;
+    user-select: none;
+}
+
+#by-email-watch-btn.active {
+    background-color: #1f6feb;
+    border-color: #1f6feb;
+    color: #fff;
+}
+
+.by-email-code-banner {
+    display: none;
+    align-items: center;
+    gap: 10px;
+    margin-top: 10px;
+    padding: 8px 12px;
+    border-radius: 8px;
+    background: rgba(31, 111, 235, 0.12);
+    border: 1px solid rgba(31, 111, 235, 0.4);
+}
+
+.by-email-code-banner .code-label {
+    font-size: 13px;
+    color: #b6c2d2;
+}
+
+.by-email-code-banner .code-value {
+    font-size: 18px;
+    font-weight: 700;
+    letter-spacing: 2px;
+    color: #4da3ff;
+}
+
 .mobile-mail-steps,
 .mail-detail-actions {
     display: flex;

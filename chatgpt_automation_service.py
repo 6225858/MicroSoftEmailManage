@@ -234,6 +234,62 @@ def claim_email(
     raise _claim_error("claim_conflict", 409, "领取冲突，请重试")
 
 
+def claim_email_by_address(
+    db: Session,
+    email: str,
+    now: int | None = None,
+    token_factory: Callable[[], str] | None = None,
+) -> dict:
+    """定向取号：按邮箱地址占用指定账号（而非随机挑选）。"""
+    claimed_at = _now(now)
+    make_token = token_factory or (lambda: secrets.token_urlsafe(32))
+    normalized = str(email or "").strip().casefold()
+    if not normalized:
+        raise _claim_error("invalid_email", 400, "email 不能为空")
+
+    account = (
+        db.query(MailAccount)
+        .filter(func.lower(MailAccount.email) == normalized)
+        .first()
+    )
+    if account is None:
+        raise _claim_error("account_not_found", 404, "未找到匹配邮箱")
+
+    # 清理该账号已过期（active 或 completed receipt）的 claim
+    db.query(ChatgptEmailClaim).filter(
+        ChatgptEmailClaim.mail_account_id == account.id,
+        ChatgptEmailClaim.expires_at <= claimed_at,
+    ).delete(synchronize_session=False)
+    db.commit()
+
+    existing = (
+        db.query(ChatgptEmailClaim)
+        .filter_by(mail_account_id=account.id)
+        .first()
+    )
+    if existing is not None:
+        raise _claim_error("email_in_use", 409, "该邮箱已被占用")
+
+    claim_token = make_token()
+    expires_at = claimed_at + ACTIVE_LEASE_SECONDS
+    db.add(
+        ChatgptEmailClaim(
+            mail_account_id=account.id,
+            claim_token=claim_token,
+            status="active",
+            claimed_at=claimed_at,
+            expires_at=expires_at,
+            completed_at=0,
+        )
+    )
+    db.commit()
+    return {
+        "email": account.email,
+        "claim_token": claim_token,
+        "expires_at": expires_at,
+    }
+
+
 def resolve_active_claim(
     db: Session,
     claim_token: str,

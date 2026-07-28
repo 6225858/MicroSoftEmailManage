@@ -300,6 +300,9 @@ const elements = {
     byEmailInput: document.getElementById("by-email-input"),
     byEmailFolder: document.getElementById("by-email-folder"),
     byEmailFetchBtn: document.getElementById("by-email-fetch-btn"),
+    byEmailExtractCode: document.getElementById("by-email-extract-code"),
+    byEmailWatchBtn: document.getElementById("by-email-watch-btn"),
+    byEmailCodeBanner: document.getElementById("by-email-code-banner"),
     viewPanels: Array.from(document.querySelectorAll(".view-panel")),
     viewTitle: document.getElementById("view-title"),
     apiKeyNameInput: document.getElementById("api-key-name-input"),
@@ -1748,16 +1751,18 @@ async function fetchMailsByEmail() {
         return;
     }
     const folder = elements.byEmailFolder ? (elements.byEmailFolder.value || "inbox") : "inbox";
+    const extractCode = elements.byEmailExtractCode ? elements.byEmailExtractCode.checked : false;
     setMessage(elements.mailMessage, `正在向 ${email} 收取最新邮件...`, false);
     resetMailView({ listText: text.loadingMails, detailText: text.loadingMails });
     elements.byEmailFetchBtn.disabled = true;
     try {
-        const params = new URLSearchParams({ email, folder });
+        const params = new URLSearchParams({ email, folder, extract_code: extractCode ? "true" : "false" });
         const data = await api(`/api/mails/by-email?${params}`);
         state.selectedAccountId = null;
         updateSelectedAccountSummary();
         state.activeFolder = folder;
         updateMailsFromData(data, data.account_id, folder);
+        renderByEmailCodeBanner(data);
         if (elements.mailPanelTitle) {
             elements.mailPanelTitle.textContent = `定向取件：${data.email}`;
         }
@@ -1780,6 +1785,94 @@ async function fetchMailsByEmail() {
     } finally {
         elements.byEmailFetchBtn.disabled = false;
     }
+}
+
+// 定向取件：验证码横幅渲染（高亮 + 一键复制）
+function renderByEmailCodeBanner(data) {
+    const banner = elements.byEmailCodeBanner;
+    if (!banner) return;
+    banner.innerHTML = "";
+    if (data && data.code) {
+        banner.style.display = "flex";
+        const label = document.createElement("span");
+        label.className = "code-label";
+        label.textContent = `验证码（${data.code_folder || "inbox"}）`;
+        const codeEl = document.createElement("span");
+        codeEl.className = "code-value";
+        codeEl.textContent = data.code;
+        const copyBtn = document.createElement("button");
+        copyBtn.className = "button button-small";
+        copyBtn.type = "button";
+        copyBtn.textContent = "复制";
+        copyBtn.addEventListener("click", () => {
+            const textToCopy = data.code;
+            const done = () => {
+                copyBtn.textContent = "已复制";
+                setTimeout(() => (copyBtn.textContent = "复制"), 1500);
+            };
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(textToCopy).then(done).catch(done);
+            } else {
+                done();
+            }
+        });
+        banner.appendChild(label);
+        banner.appendChild(codeEl);
+        banner.appendChild(copyBtn);
+    } else {
+        banner.style.display = "none";
+    }
+}
+
+// 定向取件：监听指定邮箱（定时刷新）
+let byEmailWatchTimer = null;
+
+function stopByEmailWatch() {
+    if (byEmailWatchTimer) {
+        clearInterval(byEmailWatchTimer);
+        byEmailWatchTimer = null;
+    }
+    if (elements.byEmailWatchBtn) {
+        elements.byEmailWatchBtn.classList.remove("active");
+        elements.byEmailWatchBtn.textContent = "监听";
+    }
+}
+
+async function byEmailWatchTick(email, folder, extractCode) {
+    try {
+        const params = new URLSearchParams({
+            email,
+            folder,
+            force: "true",
+            extract_code: extractCode ? "true" : "false",
+        });
+        const data = await api(`/api/mails/by-email?${params}`);
+        state.activeFolder = folder;
+        updateMailsFromData(data, data.account_id, folder);
+        renderByEmailCodeBanner(data);
+        setMessage(
+            elements.mailMessage,
+            `监听「${email}」：${data.count} 封（更新于 ${formatDateTime(data.updated_at)}）`,
+            false
+        );
+    } catch (error) {
+        setMessage(elements.mailMessage, `监听出错：${error.message}`, true);
+    }
+}
+
+function startByEmailWatch() {
+    stopByEmailWatch();
+    const email = (elements.byEmailInput.value || "").trim();
+    if (!email) {
+        setMessage(elements.mailMessage, "请先输入邮箱再开启监听", true);
+        return;
+    }
+    const folder = elements.byEmailFolder ? (elements.byEmailFolder.value || "inbox") : "inbox";
+    const extractCode = elements.byEmailExtractCode ? elements.byEmailExtractCode.checked : false;
+    elements.byEmailWatchBtn.classList.add("active");
+    elements.byEmailWatchBtn.textContent = "停止";
+    byEmailWatchTick(email, folder, extractCode);
+    byEmailWatchTimer = setInterval(() => byEmailWatchTick(email, folder, extractCode), 15000);
 }
 
 // 等待后台刷新完成并刷新视图
@@ -2115,6 +2208,8 @@ async function removeTagFromAccount(accountId, tag) {
         setMessage(elements.accountMessage, error.message, true);
     }
 }
+
+async function persistRemark(accountId, remark) {
     const data = await api(`/api/accounts/${accountId}/remark`, {
         method: "POST",
         body: JSON.stringify({ remark })
@@ -2468,6 +2563,15 @@ if (elements.forceRefreshMailsBtn) {
             fetchMailsByEmail();
         }
     });
+    if (elements.byEmailWatchBtn) {
+        elements.byEmailWatchBtn.addEventListener("click", () => {
+            if (byEmailWatchTimer) {
+                stopByEmailWatch();
+            } else {
+                startByEmailWatch();
+            }
+        });
+    }
 }
 elements.remarkModalBackdrop.addEventListener("click", closeRemarkModal);
 elements.remarkModalCancelBtn.addEventListener("click", closeRemarkModal);

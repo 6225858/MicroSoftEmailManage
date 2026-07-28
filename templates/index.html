@@ -228,8 +228,11 @@
                                     <option value="inbox">收件箱</option>
                                     <option value="junk">垃圾邮件</option>
                                 </select>
+                                <label class="by-email-option"><input type="checkbox" id="by-email-extract-code"> 提取验证码</label>
                                 <button id="by-email-fetch-btn" class="button" type="button">定向取件</button>
+                                <button id="by-email-watch-btn" class="button button-ghost" type="button">监听</button>
                             </div>
+                            <div id="by-email-code-banner" class="by-email-code-banner" style="display:none;"></div>
                         </div>
 
                         <p id="mail-message" class="message"></p>
