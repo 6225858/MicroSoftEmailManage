@@ -596,10 +596,18 @@ def get_valid_access_token(
                 )
 
     # 所有刷新失败 → 兜底返回已有 token（可能已过期，由调用方处理）
-    if account.cached_access_token and (account.access_token_expire_time or 0) > now + 30:
+    if account.cached_access_token:
+        if (account.access_token_expire_time or 0) > now + 30:
+            return account.cached_access_token
+        # 缓存已过期：仍返回给调用方，由调用方决定如何使用（如触发 IMAP fallback）
+        _oauth_log(
+            logging.WARNING,
+            account_id=account.id,
+            endpoint="cache_expired",
+            attempt=0,
+            tag="token_cache_expired",
+        )
         return account.cached_access_token
-    if account.access_token:
-        return account.access_token
     _oauth_log(
         logging.ERROR,
         account_id=account.id,

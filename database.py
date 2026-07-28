@@ -1,5 +1,6 @@
 import os
 import logging
+import shutil
 from pathlib import Path
 
 from sqlalchemy import create_engine, event
@@ -41,8 +42,54 @@ def _resolve_data_dir() -> str:
     return data_dir
 
 
+def _migrate_legacy_db(data_dir: str, project_root: str | None = None) -> None:
+    """把旧版本数据库迁移到新的存储目录，避免升级后邮箱数据“被清空”。
+
+    旧版本（早期 release）数据库路径为 ./mail.db，即写在项目根目录或
+    容器工作目录（Docker 中即 /app/mail.db）；
+    新版本统一使用 <DATA_DIR>/mail.db（本地为 data/mail.db，Docker 为 /app/data/mail.db）。
+
+    升级逻辑：
+    - 新位置已存在库 → 不迁移（保留新库，避免覆盖）。
+    - 新位置不存在库，但旧位置（项目根目录 / 当前工作目录）存在 mail.db →
+      连同 WAL 伴随文件(-wal/-shm)一起移动到新位置。
+    这样无论是本地升级还是 Docker 重新部署旧镜像，已有邮箱账号都不会丢失。
+    """
+    target_db = os.path.join(data_dir, "mail.db")
+    if os.path.exists(target_db):
+        return  # 新位置已有库，无需迁移
+
+    if project_root is None:
+        project_root = str(Path(__file__).resolve().parent)
+    # 旧版可能的两个位置：项目根目录、进程当前工作目录（如 Docker 的 /app）
+    candidates: list[str] = []
+    for base in (project_root, os.getcwd()):
+        if base and base not in candidates:
+            candidates.append(base)
+
+    for base in candidates:
+        legacy_db = os.path.join(base, "mail.db")
+        if legacy_db == target_db or not os.path.exists(legacy_db):
+            continue
+        try:
+            os.makedirs(data_dir, exist_ok=True)
+            # 同时迁移 WAL 伴随文件，确保数据完整（避免只移动主文件导致数据缺失）
+            for suffix in ("", "-wal", "-shm"):
+                src = legacy_db + suffix
+                if os.path.exists(src):
+                    shutil.move(src, target_db + suffix)
+            logger.info("检测到旧版本数据库 %s，已自动迁移到 %s", legacy_db, target_db)
+            return
+        except OSError as exc:
+            logger.warning("迁移旧版本数据库失败 %s -> %s: %s", legacy_db, target_db, exc)
+
+
 # 解析并创建数据目录
 DATA_DIR = _resolve_data_dir()
+
+# 升级兼容：旧版本数据库写在项目根/工作目录的 mail.db，
+# 新版本统一在 <DATA_DIR>/mail.db。若新位置无库但旧位置有，自动迁移，避免邮箱数据被清空。
+_migrate_legacy_db(DATA_DIR)
 
 # SQLite 数据库文件路径
 DATABASE_PATH = os.path.join(DATA_DIR, "mail.db")

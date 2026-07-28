@@ -1,3 +1,8 @@
+# MicroSoftEmailManage Docker 部署
+# 升级提示：修改代码后务必执行 `docker compose up -d --build` 重新构建镜像，
+# 否则仍会运行旧镜像（如 1.0.0 版本）。新版会在启动时把旧版本写在 /app/mail.db
+# 的数据库自动迁移到挂载卷 /app/data/mail.db，避免邮箱数据被清空。
+# 邮箱数据通过 ./data 卷持久化，请勿删除该目录或卷。
 services:
   mail-manager:
     image: ms-email-manager:latest

@@ -27,3 +27,6 @@ hotmail_mail_manager_architecture_plan.md
 Dockerfile
 .dockerignore
 docker-compose.yml
+
+# 临时诊断 / 测试文件（含邮件截图等敏感内容，禁止打包进镜像）
+_*
