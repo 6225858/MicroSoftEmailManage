@@ -404,7 +404,7 @@ def _try_msauth_refresh(account: MailAccount, proxies: dict | None) -> dict:
     raise last_error or OAuthServiceError("MSAuth refresh failed (unknown)")
 
 
-def _store_tokens(account: MailAccount, db: Session, access_token: str, new_refresh_token: str, now: int, expires_in: int | None = None) -> None:
+def _store_tokens(account: MailAccount, db: Session, access_token: str, new_refresh_token: str, now: int, expires_in: int | None = None, scope_slot: str = "graph") -> None:
     old_refresh_token = _sanitize_token(account.refresh_token)
 
     if new_refresh_token and new_refresh_token != old_refresh_token:
@@ -432,7 +432,12 @@ def _store_tokens(account: MailAccount, db: Session, access_token: str, new_refr
     else:
         cache_seconds = TOKEN_CACHE_SECONDS
 
-    account.cached_access_token = access_token
+    # 按 scope 隔离持久化，修复 graph / imap 刷新互相覆盖的历史问题
+    if scope_slot == "imap":
+        account.cached_access_token_imap = access_token
+    else:
+        account.cached_access_token_graph = access_token
+    account.cached_access_token = access_token  # 旧字段保留以兼容
     account.access_token_expire_time = now + cache_seconds
     db.commit()
     db.refresh(account)
@@ -460,6 +465,29 @@ def _token_cache_set(account_id: int, scope: str, token: str, ttl: int) -> None:
         _token_cache[key] = {"token": token, "expire": time.time() + ttl}
 
 
+def _seed_token_cache_from_db(account: MailAccount, now: int, scope_slot: str) -> str | None:
+    """进程重启后内存缓存为空时，用持久化在 DB 中且仍有效的 access_token 预热内存缓存。
+
+    只读取与 scope 对应的专用列，避免把其它 scope 的 token 误填进缓存 slot
+    （否则会因缓存命中而跳过刷新，导致错误 scope 的 token 长期滞留、协议取件失败）。
+    若对应 scope 列无值（如历史上只刷新过另一 scope），则不预热，交由网络刷新。
+    """
+    col = "cached_access_token_graph" if scope_slot == "graph" else "cached_access_token_imap"
+    cached = _sanitize_token(getattr(account, col, "") or "")
+    if not cached:
+        return None
+    expire = account.access_token_expire_time or 0
+    if expire <= now:
+        return None
+    ttl = expire - now
+    with _token_cache_lock:
+        _token_cache[(account.id, scope_slot)] = {
+            "token": cached,
+            "expire": time.time() + ttl,
+        }
+    return cached
+
+
 def get_valid_access_token(
     account: MailAccount,
     db: Session,
@@ -483,6 +511,12 @@ def get_valid_access_token(
         cached = _token_cache_get(account.id, scope_slot)
         if cached:
             return cached
+        # 进程重启后内存缓存为空：用持久化在 DB 中、且仍有效的对应 scope token 预热，
+        # 避免每个账号在重启后首次取件都强制发起一次网络刷新（甚至刷新失败需重新登录）。
+        # 只读取与 scope 对应的专用列，避免误把其它 scope 的 token 填入缓存 slot。
+        seeded = _seed_token_cache_from_db(account, now, scope_slot)
+        if seeded:
+            return seeded
 
     # 从代理池获取代理（自动轮询可用代理）
     proxies = get_session_proxy(db, account)
@@ -495,7 +529,8 @@ def get_valid_access_token(
         new_refresh_token = _sanitize_token(str(payload.get("refresh_token") or ""))
         expires_in = payload.get("expires_in")
         _store_tokens(account, db, access_token, new_refresh_token, now,
-                      expires_in=int(expires_in) if expires_in else None)
+                      expires_in=int(expires_in) if expires_in else None,
+                      scope_slot=scope_slot)
         # 缓存有效期：用 OAuth 响应中的 expires_in（留 5 分钟缓冲），否则 fallback 50 分钟
         if expires_in and expires_in > 300:
             ttl = expires_in - 300
@@ -596,9 +631,13 @@ def get_valid_access_token(
                 )
 
     # 所有刷新失败 → 兜底返回已有 token（可能已过期，由调用方处理）
-    if account.cached_access_token:
+    col = "cached_access_token_graph" if scope_slot == "graph" else "cached_access_token_imap"
+    existing = _sanitize_token(getattr(account, col, "") or "") or _sanitize_token(
+        account.cached_access_token or ""
+    )
+    if existing:
         if (account.access_token_expire_time or 0) > now + 30:
-            return account.cached_access_token
+            return existing
         # 缓存已过期：仍返回给调用方，由调用方决定如何使用（如触发 IMAP fallback）
         _oauth_log(
             logging.WARNING,
@@ -607,7 +646,7 @@ def get_valid_access_token(
             attempt=0,
             tag="token_cache_expired",
         )
-        return account.cached_access_token
+        return existing
     _oauth_log(
         logging.ERROR,
         account_id=account.id,

@@ -12,6 +12,9 @@ class MailAccount(Base):
     client_id = Column(Text, default="", nullable=False)
     refresh_token = Column(Text, default="", nullable=False)
     cached_access_token = Column(Text, default="", nullable=False)
+    # 按用途隔离的 access_token 持久化，避免 graph / imap 刷新互相覆盖
+    cached_access_token_graph = Column(Text, default="", nullable=False)
+    cached_access_token_imap = Column(Text, default="", nullable=False)
     access_token_expire_time = Column(Integer, default=0, nullable=False)
     tags = Column(Text, default="", nullable=False)
     remark = Column(Text, default="", nullable=False)

@@ -117,3 +117,40 @@ def _set_sqlite_pragma(dbapi_conn, _conn_record):
     cursor.close()
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
+
+
+def _run_schema_migrations() -> None:
+    """在 engine 创建后、任何连接被使用前执行幂等 schema 迁移。
+
+    SQLAlchemy 的 create_all 只会创建新表，不会给已存在的表添加新列。
+    已有部署的 data/mail.db 需要通过 ALTER TABLE 补齐新增列，否则升级后会报
+    'no such column'。放在 database 模块加载时执行，可保证所有连接建立前表结构已最新
+    （避免测试/运行时先打开连接缓存旧 schema，再迁移导致列不可见）。
+    """
+    migrations = [
+        ("mail_account", "cached_access_token", "TEXT DEFAULT ''"),
+        ("mail_account", "access_token_expire_time", "INTEGER DEFAULT 0"),
+        ("mail_account", "cached_access_token_graph", "TEXT DEFAULT ''"),
+        ("mail_account", "cached_access_token_imap", "TEXT DEFAULT ''"),
+    ]
+    try:
+        with engine.begin() as conn:
+            from sqlalchemy import text
+
+            for table, col, ddl in migrations:
+                exists = conn.execute(
+                    text(
+                        f"SELECT 1 FROM pragma_table_info('{table}') WHERE name='{col}'"
+                    )
+                ).first()
+                if not exists:
+                    conn.execute(
+                        text(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
+                    )
+                    logger.info("schema 迁移: 为 %s 添加列 %s", table, col)
+    except Exception as exc:  # 迁移失败不应阻断启动，下次启动重试
+        logger.warning("schema 迁移执行失败（可忽略）: %s", exc)
+
+
+# 在创建 engine 后立刻执行迁移，确保所有连接使用最新表结构
+_run_schema_migrations()

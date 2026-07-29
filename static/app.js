@@ -1584,7 +1584,21 @@ function renderMailDetail() {
         return;
     }
 
-    const bodyRender = getMailBodyRenderMode(currentMail.body);
+    const bodyText = (currentMail.body || "").trim();
+    let bodyRender;
+    if (!bodyText) {
+        const loading =
+            pendingMailBodyId != null &&
+            getMailId(pendingMailBodyId) === getMailId(state.selectedMailId);
+        bodyRender = {
+            type: "inline",
+            content: loading
+                ? `<p class="muted">正在加载正文...</p>`
+                : `<p class="muted">${escapeHtml(text.noContent)}</p>`,
+        };
+    } else {
+        bodyRender = getMailBodyRenderMode(currentMail.body);
+    }
     elements.mailDetail.className = "mail-detail";
     elements.mailDetail.innerHTML = `
         <header class="mail-detail-head">
@@ -1609,6 +1623,38 @@ function renderMailDetail() {
 
     bodyContainer.innerHTML = bodyRender.content;
     updateMailMobileView();
+}
+
+// 列表接口已不再返回正文，打开邮件时需按需调用详情接口拉取正文。
+let pendingMailBodyId = null;
+let mailBodyLoadToken = 0;
+async function loadMailBodyIntoState(mailId) {
+    const accountId = state.loadedMailAccountId;
+    if (!accountId || mailId == null) return;
+    const id = getMailId(mailId);
+    const mail = state.mails.find((m) => getMailId(m.id) === id);
+    if (!mail) return;
+    if ((mail.body || "").trim()) return; // 已有正文，无需重复请求
+
+    const token = ++mailBodyLoadToken;
+    pendingMailBodyId = id;
+    renderMailDetail(); // 先显示“正在加载正文...”
+    try {
+        const data = await api(`/api/accounts/${accountId}/mails/${encodeURIComponent(mailId)}`);
+        if (token !== mailBodyLoadToken) return; // 已切换到其它邮件，丢弃本次结果
+        if (data && typeof data === "object") {
+            if (data.body != null) mail.body = data.body;
+            if (data.html != null) mail.html = data.html;
+            if (data.attachments != null) mail.attachments = data.attachments;
+        }
+    } catch (error) {
+        // 拉取失败不阻断界面，保留空正文占位
+    } finally {
+        if (pendingMailBodyId != null && getMailId(pendingMailBodyId) === id) {
+            pendingMailBodyId = null;
+        }
+        if (token === mailBodyLoadToken) renderMailDetail();
+    }
 }
 
 function renderMails() {
@@ -1645,6 +1691,7 @@ function renderMails() {
     });
 
     renderMailDetail();
+    loadMailBodyIntoState(state.selectedMailId);
 }
 
 function updateSelectedAccountSummary() {

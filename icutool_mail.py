@@ -52,7 +52,7 @@ from chatgpt_automation_service import (
 logger = logging.getLogger("icutool_mail")
 
 # ── 应用版本 & 配置 ──────────────────────────────────────
-APP_VERSION = "1.3.6"
+APP_VERSION = "1.3.7"
 DEFAULT_GITHUB_REPO = "6225858/MicroSoftEmailManage"
 SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
 
@@ -139,6 +139,8 @@ def _run_migrations() -> None:
         ("mail_account", "remark", "TEXT DEFAULT ''"),
         ("mail_account", "cached_access_token", "TEXT DEFAULT ''"),
         ("mail_account", "access_token_expire_time", "INTEGER DEFAULT 0"),
+        ("mail_account", "cached_access_token_graph", "TEXT DEFAULT ''"),
+        ("mail_account", "cached_access_token_imap", "TEXT DEFAULT ''"),
     ]
 
     conn = sqlite3.connect(DATABASE_PATH)
