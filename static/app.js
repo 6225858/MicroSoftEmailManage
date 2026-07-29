@@ -295,6 +295,7 @@ const elements = {
     tagModalSaveBtn: document.getElementById("tag-modal-save-btn"),
     tabs: Array.from(document.querySelectorAll(".tab")),
     tagsInput: document.getElementById("tags-input"),
+    tagsPreview: document.getElementById("tags-preview"),
     mailAccountRemark: document.getElementById("mail-account-remark"),
     toggleAutoRefreshBtn: document.getElementById("toggle-auto-refresh-btn"),
     forceRefreshMailsBtn: document.getElementById("force-refresh-mails-btn"),
@@ -345,6 +346,7 @@ const elements = {
     batchTagsSaveBtn: document.getElementById("batch-tags-save-btn"),
     batchTagsMode: document.getElementById("batch-tags-mode"),
     batchTagsInput: document.getElementById("batch-tags-input"),
+    batchTagsPreview: document.getElementById("batch-tags-preview"),
     batchTagsSummary: document.getElementById("batch-tags-summary"),
     batchTagsSuggestions: document.getElementById("batch-tags-suggestions"),
     batchTagsMessage: document.getElementById("batch-tags-message"),
@@ -643,6 +645,46 @@ function renderTagMarkup(value, emptyText = text.noTags, className = "tag", inte
     }).join("");
 }
 
+// 实时把已填写标签渲染为可删除的 chips（点击 × 删除；输入框为空时按退格删除最后一个）
+function renderTagChips(inputEl, containerEl) {
+    if (!inputEl || !containerEl) return;
+    const tags = parseTags(inputEl.value);
+    if (!tags.length) {
+        containerEl.innerHTML = "";
+        containerEl.hidden = true;
+        return;
+    }
+    containerEl.hidden = false;
+    containerEl.innerHTML = tags.map((tag) =>
+        `<span class="tag tag-chip" data-tag="${escapeHtml(tag)}">${escapeHtml(tag)}<button type="button" class="tag-remove" data-tag="${escapeHtml(tag)}" aria-label="${escapeHtml(text.removeTag)}" title="${escapeHtml(text.removeTag)}">×</button></span>`
+    ).join("");
+}
+
+function bindTagChips(inputEl, containerEl) {
+    if (!inputEl || !containerEl) return;
+    inputEl.addEventListener("input", () => renderTagChips(inputEl, containerEl));
+    inputEl.addEventListener("keydown", (e) => {
+        // 输入框为空时按退格，快速删除最后一个已填标签
+        if (e.key === "Backspace" && inputEl.value === "") {
+            const tags = parseTags(inputEl.value);
+            if (tags.length) {
+                e.preventDefault();
+                inputEl.value = tags.slice(0, -1).join(", ");
+                renderTagChips(inputEl, containerEl);
+            }
+        }
+    });
+    containerEl.addEventListener("click", (e) => {
+        const btn = e.target.closest(".tag-remove[data-tag]");
+        if (!btn) return;
+        const tag = btn.dataset.tag;
+        const tags = parseTags(inputEl.value).filter((t) => t !== tag);
+        inputEl.value = tags.join(", ");
+        renderTagChips(inputEl, containerEl);
+        inputEl.focus();
+    });
+}
+
 function renderRemarkMarkup(value, emptyText = EMPTY_REMARK_TEXT, className = "remark-content") {
     const remark = (value || "").trim();
     if (!remark) {
@@ -661,8 +703,15 @@ function getAllAvailableTags() {
     return Array.from(uniqueTags).sort((left, right) => left.localeCompare(right, "zh-Hans-CN"));
 }
 
+let _cachedTagOptionsKey = null;
 function updateTagFilterOptions() {
     const availableTags = getAllAvailableTags();
+    // 标签集合未变化时跳过重绘（保存标签时账号量大，避免每次都重建下拉）
+    const key = JSON.stringify(availableTags.slice().sort());
+    if (key === _cachedTagOptionsKey) {
+        return;
+    }
+    _cachedTagOptionsKey = key;
     [elements.tagFilter, elements.mailTagFilter].forEach((select) => {
         const currentValue = select.value;
         const options = [
@@ -1002,7 +1051,18 @@ function renderAccountButtons(container, accounts, options) {
 }
 
 // 仅同步账号卡片的选中高亮,避免全量重建 DOM 造成卡顿
-function syncAccountActiveState() {
+function syncAccountActiveState(accountId) {
+    if (accountId != null) {
+        // 局部更新：只切换指定账号，避免保存标签时遍历全部账号卡片造成卡顿
+        [elements.accountList, elements.mailAccountList].forEach((container) => {
+            if (!container) return;
+            const shell = container.querySelector(`.account-item-shell[data-id="${accountId}"]`);
+            if (shell) {
+                shell.classList.toggle("account-item-active", accountId === state.selectedAccountId);
+            }
+        });
+        return;
+    }
     [elements.accountList, elements.mailAccountList].forEach((container) => {
         if (!container) {
             return;
@@ -1043,6 +1103,21 @@ function syncAccountTagRows(accountId) {
             tagRow.innerHTML = renderTagMarkup(account.tags, text.noTags, "tag", true);
         }
         mailShell.style.display = mailMatch ? "" : "none";
+    }
+}
+
+// 轻量刷新账号计数与筛选可见数量（不重绘卡片），用于批量改标签后更新概览
+function refreshFilterSummaries() {
+    const accountMatches = getFilteredAccounts(elements.searchInput.value, elements.tagFilter.value);
+    const mailMatches = getFilteredAccounts(elements.mailSearchInput.value, elements.mailTagFilter.value);
+    if (elements.accountCount) {
+        elements.accountCount.textContent = text.accountCount(state.accounts.length);
+    }
+    if (elements.accountFilterSummary) {
+        elements.accountFilterSummary.textContent = text.visibleAccountCount(accountMatches.length, state.accounts.length);
+    }
+    if (elements.mailFilterSummary) {
+        elements.mailFilterSummary.textContent = text.visibleAccountCount(mailMatches.length, state.accounts.length);
     }
 }
 
@@ -1300,6 +1375,7 @@ function openBatchTagsModal() {
     elements.batchTagsMessage.classList.remove("is-error");
     elements.batchTagsMode.value = "add";
     elements.batchTagsInput.value = "";
+    renderTagChips(elements.batchTagsInput, elements.batchTagsPreview);
     renderBatchTagsSuggestions();
     elements.batchTagsModal.hidden = false;
     elements.batchTagsInput.focus();
@@ -1328,6 +1404,7 @@ function renderBatchTagsSuggestions() {
             const parts = elements.batchTagsInput.value.split(",").map((t) => t.trim()).filter(Boolean);
             if (!parts.includes(tag)) parts.push(tag);
             elements.batchTagsInput.value = parts.join(", ");
+            renderTagChips(elements.batchTagsInput, elements.batchTagsPreview);
             elements.batchTagsInput.focus();
         });
     });
@@ -1360,7 +1437,9 @@ async function applyBatchTags() {
             if (account) account.tags = newTags;
         });
         updateTagFilterOptions();
-        renderAccounts();
+        // 局部更新被改动的账号标签行，避免批量打标签后全量重绘所有卡片造成卡顿
+        Object.keys(data.tags || {}).forEach((idStr) => syncAccountTagRows(Number(idStr)));
+        refreshFilterSummaries();
         loadTagStats();
         closeBatchTagsModal();
         const msg = text.bulkTagSuccess(data.updated) + (data.not_found ? text.bulkTagNotFound(data.not_found) : "");
@@ -1707,6 +1786,7 @@ function updateSelectedAccountSummary() {
     const account = getSelectedAccount();
     elements.selectedEmail.textContent = account ? account.email : "请选择邮箱账号";
     elements.tagsInput.value = account ? account.tags : "";
+    renderTagChips(elements.tagsInput, elements.tagsPreview);
     elements.mailPanelTitle.textContent = account ? `${account.email} 的邮件` : "请选择邮箱";
     updateMailActions();
     renderAccounts();
@@ -2429,8 +2509,9 @@ async function persistTags(accountId, tags) {
         const account = getSelectedAccount();
         if (account) {
             elements.tagsInput.value = account.tags;
+            renderTagChips(elements.tagsInput, elements.tagsPreview);
         }
-        syncAccountActiveState();
+        syncAccountActiveState(accountId);
     }
 
     return data;
@@ -2776,16 +2857,35 @@ async function copySelectedEmailAddress() {
     }
 }
 
-// 从邮件主题+正文提取验证码：优先关键词邻近，其次 6 位，再 4-8 位通用数字（等价后端 _GENERIC_CODE_RE）。
+// 去除 HTML 标签与实体，得到可读纯文本。
+// 否则邮件模板里无处不在的 CSS 颜色值（如 #202123）会被 (\d{6}) 正则误判为验证码。
+function stripHtml(html) {
+    if (!html) return "";
+    return html
+        .replace(/<style[\s\S]*?<\/style>/gi, " ")
+        .replace(/<script[\s\S]*?<\/script>/gi, " ")
+        .replace(/<[^>]+>/g, " ")
+        .replace(/&nbsp;/gi, " ")
+        .replace(/&amp;/gi, "&")
+        .replace(/&lt;/gi, "<")
+        .replace(/&gt;/gi, ">")
+        .replace(/&#(\d+);/g, (_, d) => String.fromCharCode(parseInt(d, 10)))
+        .replace(/&#x([0-9a-f]+);/gi, (_, h) => String.fromCharCode(parseInt(h, 16)))
+        .replace(/\s+/g, " ")
+        .trim();
+}
+
+// 从邮件主题+正文提取验证码：先转纯文本（剔除 HTML/CSS），优先关键词邻近，其次 6 位，再 4-8 位通用数字。
 function extractCode(mail) {
     if (!mail) return null;
-    const body = (mail.body || "").trim();
-    const blob = body || (mail.subject || "").trim();
+    const raw = (mail.body || mail.html || "").trim() || (mail.subject || "").trim();
+    if (!raw) return null;
+    const blob = stripHtml(raw);
     if (!blob) return null;
     const keywordPatterns = [
-        /验证码[^\dA-Za-z]{0,10}([A-Za-z0-9]{4,12})/,
-        /(?:verification\s*code|your\s+code|code(?:\s*is)?)[\s:：\-]{0,10}([A-Za-z0-9]{4,12})/i,
-        /\b(?:otp|pin)[\s:：\-]{0,10}([A-Za-z0-9]{4,12})/i,
+        /验证码[^\dA-Za-z]{0,12}([A-Za-z0-9]{4,12})/,
+        /(?:verification\s*code|your\s+code|code(?:\s*is)?)[\s:：\-]{0,12}([A-Za-z0-9]{4,12})/i,
+        /\b(?:otp|pin)[\s:：\-]{0,12}([A-Za-z0-9]{4,12})/i,
     ];
     for (const re of keywordPatterns) {
         const m = blob.match(re);
@@ -2918,6 +3018,9 @@ if (elements.mailDetail) {
         }
     });
 }
+// 标签输入框 chips 预览：快速填写后点击 × 或空输入退格即可快速删除
+bindTagChips(elements.tagsInput, elements.tagsPreview);
+bindTagChips(elements.batchTagsInput, elements.batchTagsPreview);
 elements.toggleAutoRefreshBtn.addEventListener("click", toggleAutoRefresh);
 if (elements.forceRefreshMailsBtn) {
     elements.forceRefreshMailsBtn.addEventListener("click", forceRefreshMails);

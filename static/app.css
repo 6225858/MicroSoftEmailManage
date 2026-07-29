@@ -795,6 +795,19 @@ time,
     opacity: 1;
 }
 
+/* 标签输入框下方的 chips 预览：快速填写标签后点击 × 即可快速删除 */
+.tag-chips-preview {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 6px;
+}
+
+.tag-chip {
+    margin: 0;
+    cursor: default;
+}
+
 /* 标签弹窗内的“当前标签”：删除符号常显，无需 hover 即可点删 */
 .tag-modal-current-tags {
     display: flex;

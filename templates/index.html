@@ -145,6 +145,7 @@
                             <div class="stack gap-sm">
                                 <label class="field-label" for="tags-input">标签</label>
                                 <input id="tags-input" class="input" type="text" placeholder="多个标签请用逗号分隔">
+                                <div id="tags-preview" class="tag-chips-preview" hidden></div>
                                 <div class="action-row">
                                     <button id="save-tags-btn" class="button" type="button">保存标签</button>
                                     <button id="open-mails-btn" class="button button-ghost" type="button">查看该账号邮件</button>
@@ -730,6 +731,7 @@
             <div class="stack gap-sm">
                 <label class="field-label" for="batch-tags-input">标签内容</label>
                 <input id="batch-tags-input" class="input" type="text" placeholder="例如：注册号，站点A，重点关注">
+                <div id="batch-tags-preview" class="tag-chips-preview" hidden></div>
                 <div class="modal-hint-row">
                     <span>多个标签请用逗号分隔（add / remove 模式）</span>
                     <span>Ctrl + Enter 快速应用</span>
