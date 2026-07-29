@@ -484,37 +484,67 @@ def _load_with_protocol_selection(
             )
         return _load_by_protocol_name(current_protocol, account, db, folder=folder, limit=limit)
 
-    # 自动选择模式
-    # 构造尝试顺序：上次成功的协议优先 + 标准 graph → imap → pop3
-    if last_used and last_used in _PROTOCOL_CHAIN:
-        # 上次成功的协议放第一个，其余按标准顺序
-        chain = [last_used] + [p for p in _PROTOCOL_CHAIN if p != last_used]
+    # 自动选择模式 —— OAuth2 登录优先
+    # ------------------------------------------------------------------
+    # 设计目标：凡具备 OAuth2 凭据(refresh_token + client_id)的账号，
+    # 一律优先尝试 OAuth2 认证(XOAUTH2 / Graph)，仅在 OAuth2 链全部失败后
+    # 才回退到纯密码认证。不再允许“上次成功的密码协议”被顶到 OAuth2 之前。
+    #
+    # 认证类型与协议映射：
+    #   • OAuth2 链(graph → imap → pop3)：均走 XOAUTH2 / Graph(Bearer)
+    #   • 密码链(imap → pop3)：走基础密码认证
+    # 注意 imap/pop3 在两条链里都可能出现，但认证方式不同，需分开尝试。
+    has_oauth = bool((account.refresh_token or "").strip() and (account.client_id or "").strip())
+
+    def _order_oauth2(base):
+        # OAuth2 链内部排序：优先上次成功的 OAuth2 协议，再按 graph→imap→pop3
+        if last_used and last_used in base:
+            return [last_used] + [p for p in base if p != last_used]
+        return list(base)
+
+    def _apply_graph_optimizations(chain_in):
+        # M.C / 个人版 token 没有 Mail.Read，Graph 必 401 → 跳过 Graph
+        if _is_msauth_token(account.refresh_token):
+            chain_in = [p for p in ("imap", "pop3", "graph") if p in chain_in]
+        # 已知账号 Graph 必然 401 → Graph 移到最后
+        account_id = getattr(account, "id", None)
+        if account_id is not None and account_id in _graph_401_accounts and "graph" in chain_in:
+            chain_in = [p for p in chain_in if p != "graph"] + ["graph"]
+        return chain_in
+
+    if has_oauth:
+        # OAuth2 优先：先跑 OAuth2 链(graph → imap → pop3)
+        oauth_chain = _order_oauth2(_PROTOCOL_CHAIN)
+        oauth_chain = _apply_graph_optimizations(oauth_chain)
+        # 密码链仅作为 OAuth2 全部失败后的兜底(imap → pop3)
+        pwd_chain = [p for p in ("imap", "pop3") if p in _PROTOCOL_CHAIN]
+        # 上次成功的“密码协议”在密码链内部优先
+        if last_used and last_used in pwd_chain:
+            pwd_chain = [last_used] + [p for p in pwd_chain if p != last_used]
+        chain = ("oauth2", oauth_chain, pwd_chain)
     else:
-        chain = list(_PROTOCOL_CHAIN)
+        # 无 OAuth2 凭据 → 直接走密码链(上次成功的密码协议优先)
+        if last_used and last_used in _PROTOCOL_CHAIN:
+            pwd_chain = [last_used] + [p for p in _PROTOCOL_CHAIN if p != last_used]
+        else:
+            pwd_chain = list(_PROTOCOL_CHAIN)
+        chain = ("password", [], pwd_chain)
 
-    # M.C / 个人版(Microsoft Account)token 只有 wl.imap/wl.basic scope，没有 Mail.Read，
-    # Graph API 必定 401，因此优先走 IMAP/POP3(XOAUTH2)，跳过必失败的 Graph，避免无效等待。
-    if _is_msauth_token(account.refresh_token):
-        chain = [p for p in ("imap", "pop3", "graph") if p in chain]
-
-    # 已知该账号 Graph 必然 401（如未识别的 M.C token），把 Graph 移到最后，
-    # 避免每次自动取件都先浪费一次 30s 超时
-    account_id = getattr(account, "id", None)
-    if account_id is not None and account_id in _graph_401_accounts and "graph" in chain:
-        chain = [p for p in chain if p != "graph"] + ["graph"]
-
+    # 标记：OAuth2 链是否已全部尝试完毕，用于衔接密码链
+    _oauth_done = False
     last_error: MailServiceError | None = None
     tried: list[str] = []
     errors: list[str] = []  # 收集所有协议的失败原因
 
-    for protocol in chain:
+    def _try_protocol(protocol: str, oauth2_only: bool):
+        """尝试单个协议；成功则返回邮件列表（由调用方决定是否 return），失败记录错误后返回 None。"""
         # 跳过没有凭据的协议
         if not _can_use_protocol(protocol, account):
             logger.info(
                 "邮箱 account=%s 跳过 %s 协议（缺少凭据）",
                 _account_log_id(account), protocol.upper(),
             )
-            continue
+            return None
 
         # 优化：如果 IMAP 连接超时，跳过 POP3
         # IMAP 和 POP3 连接同一个服务器 outlook.office365.com，
@@ -525,16 +555,19 @@ def _load_with_protocol_selection(
                 _account_log_id(account),
             )
             errors.append("POP3: 跳过（IMAP 连接超时，同一服务器也会超时）")
-            continue
+            return None
 
         tried.append(protocol)
         logger.info(
-            "邮箱 account=%s 尝试 %s 协议取件",
+            "邮箱 account=%s 尝试 %s 协议取件%s",
             _account_log_id(account), protocol.upper(),
+            "（OAuth2 专用）" if oauth2_only else "",
         )
 
         try:
-            items = _load_by_protocol_name(protocol, account, db, folder=folder, limit=limit)
+            items = _load_by_protocol_name(
+                protocol, account, db, folder=folder, limit=limit, oauth2_only=oauth2_only
+            )
             # 成功 → 记录到 last_used_protocol（不修改 protocol 字段）
             if last_used != protocol:
                 account.last_used_protocol = protocol
@@ -548,6 +581,7 @@ def _load_with_protocol_selection(
                 )
             return items
         except MailServiceError as exc:
+            nonlocal last_error
             last_error = exc
             errors.append(f"{protocol.upper()}: {exc.message}")
             logger.warning(
@@ -555,9 +589,27 @@ def _load_with_protocol_selection(
                 _account_log_id(account), protocol.upper(), safe_mail_error_tag(exc),
             )
             # 自动选择模式下：任何错误都继续尝试下一个协议
-            continue
+            return None
 
-    # 所有协议都失败 → 返回汇总错误(包含每个协议的失败原因)
+    # ── 阶段一：OAuth2 链（graph → imap → pop3，均走 XOAUTH2/Bearer）──
+    #    仅当账号具备 OAuth2 凭据时执行；OAuth2 失败不回退密码。
+    #    任意一个 OAuth2 协议成功即返回；全失败则进入阶段二密码兜底。
+    oauth_chain = chain[1] if isinstance(chain, tuple) else []
+    pwd_chain = chain[2] if isinstance(chain, tuple) else list(chain)
+    if isinstance(chain, tuple) and chain[0] == "oauth2":
+        for protocol in oauth_chain:
+            result = _try_protocol(protocol, oauth2_only=True)
+            if result is not None:
+                return result
+        # 阶段一全部失败 → 进入下方阶段二密码兜底（last_error 已记录）
+
+    # ── 阶段二：密码链（imap → pop3，走基础密码认证）──
+    #    OAuth2 全部失败后的兜底；无 OAuth2 凭据的账号直接走这里。
+    for protocol in pwd_chain:
+        result = _try_protocol(protocol, oauth2_only=False)
+        if result is not None:
+            return result
+
     if last_error:
         # 构建详细的诊断信息
         detail = "\n".join(f"  • {e}" for e in errors)
@@ -606,12 +658,15 @@ def _load_by_protocol_name(
     db: Session,
     folder: str = "inbox",
     limit: int = 20,
+    oauth2_only: bool = False,
 ) -> list[dict]:
-    """按协议名分发到对应的取件函数"""
+    """按协议名分发到对应的取件函数。
+    oauth2_only=True 时，imap/pop3 强制仅 XOAUTH2 认证（OAuth2 优先策略专用）。
+    """
     if protocol == "imap":
-        return load_imap_messages(account, db, folder=folder, limit=limit)
+        return load_imap_messages(account, db, folder=folder, limit=limit, oauth2_only=oauth2_only)
     if protocol == "pop3":
-        return load_pop3_messages(account, db, folder=folder, limit=limit)
+        return load_pop3_messages(account, db, folder=folder, limit=limit, oauth2_only=oauth2_only)
     return load_mail_messages(account, db, folder=folder, limit=limit)
 
 
@@ -656,8 +711,20 @@ def load_account_mails_with_protocol(
     if protocol == "auto":
         return load_account_mails(account, db, folder=folder, limit=limit)
     if protocol == "imap":
+        # OAuth2 优先：账号具备 OAuth2 凭据时先以 XOAUTH2 专用方式尝试，
+        # 失败（如 token 过期且无密码兜底）再回退到密码认证。
+        if account.refresh_token and account.client_id:
+            try:
+                return load_imap_messages(account, db, folder=folder, limit=limit, oauth2_only=True)
+            except MailServiceError:
+                pass
         return load_imap_messages(account, db, folder=folder, limit=limit)
     if protocol == "pop3":
+        if account.refresh_token and account.client_id:
+            try:
+                return load_pop3_messages(account, db, folder=folder, limit=limit, oauth2_only=True)
+            except MailServiceError:
+                pass
         return load_pop3_messages(account, db, folder=folder, limit=limit)
     # 未知 / 显式 graph 协议统一走 Graph
     return load_mail_messages(account, db, folder=folder, limit=limit)
@@ -955,10 +1022,12 @@ class _ProxiedPOP3(poplib.POP3):
         return super()._create_socket(timeout)
 
 
-def get_imap_conn(account: MailAccount, db: Session):
+def get_imap_conn(account: MailAccount, db: Session, oauth2_only: bool = False):
     """建立并返回已认证的 IMAP 连接（含 SSL/代理/OAuth2(XOAUTH2) 或密码认证）。
 
     抽取自 load_imap_messages，供单封取件复用，避免重复连接逻辑。
+    oauth2_only=True 时：强制仅使用 XOAUTH2 认证，OAuth2 失败直接抛错，
+    绝不回退到密码认证（用于 OAuth2 优先策略下对 imap 协议的专用尝试）。
     """
     server, port, use_ssl = _resolve_imap_config(account)
     password = account.password or ""
@@ -971,8 +1040,8 @@ def get_imap_conn(account: MailAccount, db: Session):
         try:
             access_token = get_valid_access_token(account, db, required_scope="imap")
         except OAuthServiceError as exc:
-            # OAuth2 失败时若仍有密码，fallback 到密码认证
-            if password:
+            # OAuth2 失败时若仍有密码，fallback 到密码认证（非 oauth2_only 模式）
+            if password and not oauth2_only:
                 logger.warning(
                     "邮箱 account=%s IMAP OAuth2 取 token 失败，回退到密码认证: error=oauth_token_failed",
                     _account_log_id(account),
@@ -986,7 +1055,7 @@ def get_imap_conn(account: MailAccount, db: Session):
         except Exception as exc:  # noqa: BLE001
             # 任何非 OAuthServiceError 的异常（网络错误/解析错误等）也必须转成
             # MailServiceError，否则会穿透成 unexpected_error 且不触发协议回退
-            if password:
+            if password and not oauth2_only:
                 logger.warning(
                     "邮箱 account=%s IMAP 取 token 异常，回退到密码认证: error=%s",
                     _account_log_id(account), type(exc).__name__,
@@ -1031,8 +1100,8 @@ def get_imap_conn(account: MailAccount, db: Session):
                 # imaplib 的 authenticate 第二参数是回调，回调接收 token 字节并返回 SASL 响应
                 mail.authenticate("XOAUTH2", lambda _x: auth_string.encode("utf-8"))
             except imaplib.IMAP4.error as exc:
-                # XOAUTH2 失败时如果有密码，fallback 到密码
-                if password:
+                # XOAUTH2 失败时如果有密码且非 oauth2_only，fallback 到密码
+                if password and not oauth2_only:
                     logger.warning(
                         "邮箱 account=%s IMAP XOAUTH2 认证失败，回退到密码认证: error=imap_auth_failed",
                         _account_log_id(account),
@@ -1067,13 +1136,15 @@ def load_imap_messages(
     db: Session,
     folder: str = "inbox",
     limit: int = 20,
+    oauth2_only: bool = False,
 ) -> list[dict]:
     """通过 IMAP 协议取件。
     - 如果账号有 refresh_token + client_id，优先用 OAuth2 access_token (XOAUTH2) 认证
     - 否则用邮箱密码认证
     两种方式自动切换，无需用户手动选择。
+    oauth2_only=True 时强制仅 XOAUTH2 认证，失败即抛错（OAuth2 优先策略专用）。
     """
-    mail = get_imap_conn(account, db)
+    mail = get_imap_conn(account, db, oauth2_only=oauth2_only)
     try:
         target_folder = _select_imap_folder(mail, folder)
         status, _data = mail.select(target_folder, readonly=True)
@@ -1145,12 +1216,14 @@ def load_pop3_messages(
     db: Session,
     folder: str = "inbox",
     limit: int = 20,
+    oauth2_only: bool = False,
 ) -> list[dict]:
     """通过 POP3 协议取件。
     - 如果账号有 refresh_token + client_id，优先用 OAuth2 access_token (XOAUTH2) 认证
     - 否则用邮箱密码认证
     两种方式自动切换，无需用户手动选择。
     POP3 仅支持收件箱。
+    oauth2_only=True 时强制仅 XOAUTH2 认证，失败即抛错（OAuth2 优先策略专用）。
     """
     server, port, use_ssl = _resolve_pop3_config(account)
     password = account.password or ""
@@ -1163,8 +1236,8 @@ def load_pop3_messages(
         try:
             access_token = get_valid_access_token(account, db, required_scope="imap")
         except OAuthServiceError as exc:
-            # OAuth2 失败时若仍有密码，fallback 到密码认证
-            if password:
+            # OAuth2 失败时若仍有密码且非 oauth2_only，fallback 到密码认证
+            if password and not oauth2_only:
                 logger.warning(
                     "邮箱 account=%s POP3 OAuth2 取 token 失败，回退到密码认证: error=oauth_token_failed",
                     _account_log_id(account),
@@ -1176,7 +1249,7 @@ def load_pop3_messages(
                     tag="oauth_token_failed",
                 ) from exc
         except Exception as exc:  # noqa: BLE001
-            if password:
+            if password and not oauth2_only:
                 logger.warning(
                     "邮箱 account=%s POP3 取 token 异常，回退到密码认证: error=%s",
                     _account_log_id(account), type(exc).__name__,
@@ -1232,7 +1305,7 @@ def load_pop3_messages(
                 except Exception:
                     pass
 
-                if not password:
+                if not password or oauth2_only:
                     raise MailServiceError(
                         f"POP3 XOAUTH2 login failed: {exc}",
                         tag="pop3_auth_failed",
@@ -1344,7 +1417,14 @@ def load_single_mail_with_protocol(
         return _load_single_imap_mail(account, db, mail_id, folder)
     if effective_protocol == "pop3":
         # POP3 不支持按 Message-ID 检索，仍需遍历；列表已含正文，直接匹配返回
-        items = load_pop3_messages(account, db, folder=folder, limit=50)
+        # OAuth2 优先：先以 XOAUTH2 专用方式尝试，失败再密码兜底
+        if account.refresh_token and account.client_id:
+            try:
+                items = load_pop3_messages(account, db, folder=folder, limit=50, oauth2_only=True)
+            except MailServiceError:
+                items = load_pop3_messages(account, db, folder=folder, limit=50)
+        else:
+            items = load_pop3_messages(account, db, folder=folder, limit=50)
         for item in items or []:
             if item.get("id") == mail_id:
                 return item
@@ -1365,7 +1445,15 @@ def _load_single_imap_mail(
     通过 `UID SEARCH HEADER Message-ID` 精确定位，再拉取该封的完整 RFC822，
     避免为取一封邮件而重新拉取整个列表（原先要重载 50 封再按 id 匹配）。
     """
-    mail = get_imap_conn(account, db)
+    # OAuth2 优先：账号具备 OAuth2 凭据时先以 XOAUTH2 专用方式连接，
+    # 失败再回退到密码认证（get_imap_conn 默认 oauth2_only=False）。
+    if account.refresh_token and account.client_id:
+        try:
+            mail = get_imap_conn(account, db, oauth2_only=True)
+        except MailServiceError:
+            mail = get_imap_conn(account, db)
+    else:
+        mail = get_imap_conn(account, db)
     try:
         target_folder = _select_imap_folder(mail, folder)
         try:

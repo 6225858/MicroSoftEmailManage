@@ -630,23 +630,15 @@ def get_valid_access_token(
                     tag="refresh_failed",
                 )
 
-    # 所有刷新失败 → 兜底返回已有 token（可能已过期，由调用方处理）
+    # 所有刷新失败 → 兜底复用“同 scope”的已持久化 token（仅当仍有效）。
+    # 注意：不要回退到旧的 cached_access_token（可能是另一 scope 的 token），
+    # 否则 Graph 请求拿到 IMAP token 会 401，被误报为 token_invalid；也不要返回已过期 token。
     col = "cached_access_token_graph" if scope_slot == "graph" else "cached_access_token_imap"
-    existing = _sanitize_token(getattr(account, col, "") or "") or _sanitize_token(
-        account.cached_access_token or ""
-    )
-    if existing:
-        if (account.access_token_expire_time or 0) > now + 30:
-            return existing
-        # 缓存已过期：仍返回给调用方，由调用方决定如何使用（如触发 IMAP fallback）
-        _oauth_log(
-            logging.WARNING,
-            account_id=account.id,
-            endpoint="cache_expired",
-            attempt=0,
-            tag="token_cache_expired",
-        )
-        return existing
+    same_scope = _sanitize_token(getattr(account, col, "") or "")
+    if same_scope and (account.access_token_expire_time or 0) > now + 30:
+        return same_scope
+    # 没有可用的同 scope token：如实抛出刷新错误，让协议链正确回退 / 报出真实原因，
+    # 而不是返回一个过期或错 scope 的 token 导致 401 -> 误导性的 token_invalid。
     _oauth_log(
         logging.ERROR,
         account_id=account.id,

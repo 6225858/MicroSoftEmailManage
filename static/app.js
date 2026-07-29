@@ -2875,26 +2875,43 @@ function stripHtml(html) {
         .trim();
 }
 
-// 从邮件主题+正文提取验证码：先转纯文本（剔除 HTML/CSS），优先关键词邻近，其次 6 位，再 4-8 位通用数字。
+// 从邮件主题+正文提取验证码。
+// 关键修复：必须存在验证码相关关键词（验证码 / verification code / security code / your code / otp / pin 等）
+// 且候选码与该关键词位于同一行（或直接跟在关键词后），才认为这是验证码。
+// 否则返回 null —— 避免把手机号、订单号、邮编、时间戳、IP、tracking number 等任意数字误判为验证码。
 function extractCode(mail) {
     if (!mail) return null;
-    const raw = (mail.body || mail.html || "").trim() || (mail.subject || "").trim();
+    const subject = (mail.subject || "").trim();
+    const raw = (mail.body || mail.html || "").trim() || subject;
     if (!raw) return null;
-    const blob = stripHtml(raw);
-    if (!blob) return null;
-    const keywordPatterns = [
-        /验证码[^\dA-Za-z]{0,12}([A-Za-z0-9]{4,12})/,
-        /(?:verification\s*code|your\s+code|code(?:\s*is)?)[\s:：\-]{0,12}([A-Za-z0-9]{4,12})/i,
-        /\b(?:otp|pin)[\s:：\-]{0,12}([A-Za-z0-9]{4,12})/i,
-    ];
-    for (const re of keywordPatterns) {
-        const m = blob.match(re);
+    const text = stripHtml(raw);
+    if (!text) return null;
+
+    // 强关键词（明确指向“验证码/一次性密码”，避免 "QR code"/"postal code"/"area code" 等误触发）
+    // 紧跟 0~多个分隔符后捕获候选码（字母数字组合，如 ABC123 / G-123456）。
+    const KW_CODE_RE = /(?:验证码|校验码|动态码|安全码|确认码|一次性密码|动态口令|verification\s*code|security\s*code|your\s*code|one[- ]?time\s*code|\botp\b|\bpin\b)[\s:：\-=]*([A-Za-z0-9][A-Za-z0-9\-]{3,11})/i;
+    const KW_LINE_RE = /验证码|校验码|动态码|安全码|确认码|一次性密码|动态口令|verification\s*code|security\s*code|your\s*code|one[- ]?time\s*code|\botp\b|\bpin\b/i;
+    const lines = text.split(/\r?\n/);
+
+    // 1) 关键词同行内：优先“关键词后紧跟的候选码”，其次该行内的 6 位数字
+    for (const line of lines) {
+        const m = line.match(KW_CODE_RE);
         if (m) return m[1];
     }
-    const six = blob.match(/(?<!\d)(\d{6})(?!\d)/);
-    if (six) return six[1];
-    const generic = blob.match(/(?<!\d)(\d{4,8})(?!\d)/);
-    if (generic) return generic[1];
+    for (const line of lines) {
+        if (KW_LINE_RE.test(line)) {
+            const six = line.match(/(?<!\d)(\d{6})(?!\d)/);
+            if (six) return six[1];
+        }
+    }
+
+    // 2) 主题本身明确是验证码邮件，且正文中存在一个 6 位数字
+    //    （部分验证邮件正文为图片，仅主题/正文残留数字时仍可提取）
+    if (KW_LINE_RE.test(subject)) {
+        const six = text.match(/(?<!\d)(\d{6})(?!\d)/);
+        if (six) return six[1];
+    }
+
     return null;
 }
 
