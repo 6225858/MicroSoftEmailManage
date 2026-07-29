@@ -196,6 +196,7 @@ const elements = {
     accountMessage: document.getElementById("account-message"),
     autoRefreshState: document.getElementById("auto-refresh-state"),
     copyMailAddressBtn: document.getElementById("copy-mail-address-btn"),
+    copyLatestCodeBtn: document.getElementById("copy-latest-code-btn"),
     exportAccountsBtn: document.getElementById("export-accounts-btn"),
     importBtn: document.getElementById("import-btn"),
     importInput: document.getElementById("import-input"),
@@ -398,6 +399,13 @@ const text = {
     bulkTagNotFound: (n) => `，${n} 个账号未找到（可能已被删除）`,
     copyMailAddressSuccess: "邮箱地址已复制",
     copyMailAddressUnavailable: "当前没有可复制的邮箱地址",
+    copyLatestCodeBtn: "复制最新验证码",
+    copyCodeBtn: "复制验证码",
+    copyCodeExtracting: "提取中...",
+    copyCodeNoMail: "暂无邮件，无法复制验证码",
+    copyCodeNotFound: "未在该邮件中找到验证码",
+    copyCodeSuccess: "已复制验证码",
+    copyCodeUnavailable: "复制失败，请手动复制",
     bulkDeleteNone: "请先勾选要删除的邮箱账号",
     bulkDeleteConfirmTitle: (count) => `确认删除 ${count} 个邮箱账号?`,
     bulkDeleteSuccess: (count) => `已成功删除 ${count} 个邮箱账号`,
@@ -1606,6 +1614,7 @@ function renderMailDetail() {
             <p>From: ${escapeHtml(currentMail.mail_from || "-")}</p>
             <p>To: ${escapeHtml(currentMail.mail_to || "-")}</p>
             <p>Time: ${escapeHtml(currentMail.mail_dt || "-")}</p>
+            <button class="button button-ghost mail-copy-code-btn" type="button" data-action="copy-current-code">${extractCode(currentMail) ? `${text.copyCodeBtn}: ${extractCode(currentMail)}` : text.copyCodeBtn}</button>
         </header>
         <section class="mail-detail-body"></section>
     `;
@@ -2767,6 +2776,108 @@ async function copySelectedEmailAddress() {
     }
 }
 
+// 从邮件主题+正文提取验证码：优先关键词邻近，其次 6 位，再 4-8 位通用数字（等价后端 _GENERIC_CODE_RE）。
+function extractCode(mail) {
+    if (!mail) return null;
+    const body = (mail.body || "").trim();
+    const blob = body || (mail.subject || "").trim();
+    if (!blob) return null;
+    const keywordPatterns = [
+        /验证码[^\dA-Za-z]{0,10}([A-Za-z0-9]{4,12})/,
+        /(?:verification\s*code|your\s+code|code(?:\s*is)?)[\s:：\-]{0,10}([A-Za-z0-9]{4,12})/i,
+        /\b(?:otp|pin)[\s:：\-]{0,10}([A-Za-z0-9]{4,12})/i,
+    ];
+    for (const re of keywordPatterns) {
+        const m = blob.match(re);
+        if (m) return m[1];
+    }
+    const six = blob.match(/(?<!\d)(\d{6})(?!\d)/);
+    if (six) return six[1];
+    const generic = blob.match(/(?<!\d)(\d{4,8})(?!\d)/);
+    if (generic) return generic[1];
+    return null;
+}
+
+// 列表接口不返回正文，确保邮件正文已加载后再提取（命中缓存时详情接口秒回）。
+async function ensureMailBody(mail) {
+    if (!mail) return mail;
+    if ((mail.body || "").trim()) return mail;
+    const accountId = state.loadedMailAccountId;
+    if (!accountId) return mail;
+    try {
+        const data = await api(`/api/accounts/${accountId}/mails/${encodeURIComponent(mail.id)}`);
+        if (data && typeof data === "object") {
+            if (data.body != null) mail.body = data.body;
+            if (data.html != null) mail.html = data.html;
+        }
+    } catch (error) {
+        // 加载失败不影响后续重试
+    }
+    return mail;
+}
+
+async function copyTextToClipboard(value) {
+    if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(value);
+        return;
+    }
+    const input = document.createElement("input");
+    input.value = value;
+    input.style.position = "fixed";
+    input.style.opacity = "0";
+    document.body.appendChild(input);
+    input.select();
+    document.execCommand("copy");
+    input.remove();
+}
+
+function getSelectedMail() {
+    if (state.selectedMailId == null) return null;
+    return state.mails.find((m) => getMailId(m.id) === getMailId(state.selectedMailId)) || null;
+}
+
+async function copyMailCode(mail) {
+    if (!mail) {
+        setMessage(elements.mailMessage, text.copyCodeNoMail, true);
+        return;
+    }
+    await ensureMailBody(mail);
+    const code = extractCode(mail);
+    if (!code) {
+        setMessage(elements.mailMessage, text.copyCodeNotFound, true);
+        return;
+    }
+    try {
+        await copyTextToClipboard(code);
+        setMessage(elements.mailMessage, `${text.copyCodeSuccess}: ${code}`, false);
+    } catch (error) {
+        setMessage(elements.mailMessage, text.copyCodeUnavailable, true);
+    }
+}
+
+// 复制最新邮件（列表首封，按时间降序）内的验证码。
+async function copyLatestMailCode() {
+    const btn = elements.copyLatestCodeBtn;
+    const original = btn ? btn.textContent : text.copyLatestCodeBtn;
+    if (btn) {
+        btn.disabled = true;
+        btn.textContent = text.copyCodeExtracting;
+    }
+    try {
+        await copyMailCode(state.mails[0] || null);
+    } finally {
+        if (btn) {
+            btn.disabled = false;
+            btn.textContent = original;
+        }
+    }
+}
+
+// 复制当前打开邮件内的验证码（邮件详情头部按钮触发）。
+async function copyCurrentMailCode() {
+    await copyMailCode(getSelectedMail());
+}
+
 function toggleAutoRefresh() {
     state.autoRefreshEnabled = !state.autoRefreshEnabled;
     localStorage.setItem("mail_manager_auto_refresh", state.autoRefreshEnabled ? "1" : "0");
@@ -2796,6 +2907,17 @@ elements.saveTagsBtn.addEventListener("click", saveTags);
 elements.saveRemarkBtn.addEventListener("click", saveRemark);
 elements.openMailsBtn.addEventListener("click", openSelectedAccountMails);
 elements.copyMailAddressBtn.addEventListener("click", copySelectedEmailAddress);
+if (elements.copyLatestCodeBtn) {
+    elements.copyLatestCodeBtn.addEventListener("click", copyLatestMailCode);
+}
+// 邮件详情头部的“复制验证码”按钮通过事件委托触发（详情区域每次重渲染 innerHTML）。
+if (elements.mailDetail) {
+    elements.mailDetail.addEventListener("click", (e) => {
+        if (e.target.closest('[data-action="copy-current-code"]')) {
+            copyCurrentMailCode();
+        }
+    });
+}
 elements.toggleAutoRefreshBtn.addEventListener("click", toggleAutoRefresh);
 if (elements.forceRefreshMailsBtn) {
     elements.forceRefreshMailsBtn.addEventListener("click", forceRefreshMails);
