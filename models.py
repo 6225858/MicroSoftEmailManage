@@ -16,6 +16,8 @@ class MailAccount(Base):
     cached_access_token_graph = Column(Text, default="", nullable=False)
     cached_access_token_imap = Column(Text, default="", nullable=False)
     access_token_expire_time = Column(Integer, default=0, nullable=False)
+    cached_access_token_graph_expire_time = Column(Integer, default=0, nullable=False)
+    cached_access_token_imap_expire_time = Column(Integer, default=0, nullable=False)
     tags = Column(Text, default="", nullable=False)
     remark = Column(Text, default="", nullable=False)
     valid_status = Column(Integer, default=1, nullable=False)
@@ -23,6 +25,9 @@ class MailAccount(Base):
     protocol = Column(Text, default="auto", nullable=False)
     # 上次成功使用的协议（自动选择模式下的优化提示，避免每次都从头尝试）
     last_used_protocol = Column(Text, default="", nullable=False)
+    # 上次成功的 OAuth2 取件模式：new_gr（新GR）/ old_gr（老GR）/ imap_oauth2（IMAP）
+    # 空表示尚未探测出来，下次刷新会按 新GR → 老GR → IMAP 顺序重新探测
+    oauth_mode = Column(Text, default="", nullable=False)
     # IMAP/POP3 服务器地址，留空则使用微软默认值
     mail_server = Column(Text, default="", nullable=False)
     # IMAP/POP3 服务器端口，0 表示按协议默认值

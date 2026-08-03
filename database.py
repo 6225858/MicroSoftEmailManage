@@ -132,6 +132,9 @@ def _run_schema_migrations() -> None:
         ("mail_account", "access_token_expire_time", "INTEGER DEFAULT 0"),
         ("mail_account", "cached_access_token_graph", "TEXT DEFAULT ''"),
         ("mail_account", "cached_access_token_imap", "TEXT DEFAULT ''"),
+        ("mail_account", "cached_access_token_graph_expire_time", "INTEGER DEFAULT 0"),
+        ("mail_account", "cached_access_token_imap_expire_time", "INTEGER DEFAULT 0"),
+        ("mail_account", "oauth_mode", "TEXT NOT NULL DEFAULT ''"),
     ]
     try:
         with engine.begin() as conn:
@@ -148,6 +151,22 @@ def _run_schema_migrations() -> None:
                         text(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
                     )
                     logger.info("schema 迁移: 为 %s 添加列 %s", table, col)
+            conn.execute(
+                text(
+                    "UPDATE mail_account SET "
+                    "cached_access_token_graph_expire_time = access_token_expire_time "
+                    "WHERE cached_access_token_graph_expire_time = 0 "
+                    "AND cached_access_token_graph != ''"
+                )
+            )
+            conn.execute(
+                text(
+                    "UPDATE mail_account SET "
+                    "cached_access_token_imap_expire_time = access_token_expire_time "
+                    "WHERE cached_access_token_imap_expire_time = 0 "
+                    "AND cached_access_token_imap != ''"
+                )
+            )
     except Exception as exc:  # 迁移失败不应阻断启动，下次启动重试
         logger.warning("schema 迁移执行失败（可忽略）: %s", exc)
 

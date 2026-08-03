@@ -5,6 +5,7 @@ import re
 import logging
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -22,10 +23,11 @@ from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from database import Base, SessionLocal, engine, DATABASE_PATH
-from mail_service import MailServiceError, load_account_mails, list_account_folders, load_single_mail, list_account_folders_with_protocol, load_single_mail_with_protocol
+from mail_service import MailServiceError, load_account_mails, list_account_folders, load_single_mail, list_account_folders_with_protocol, load_single_mail_with_protocol, is_body_missing
 from mail_cache_service import (
     get_mail_cache,
     save_mail_cache,
+    update_mail_body,
     refresh_mail_cache_async,
     refresh_mail_cache_sync,
     wait_for_refresh,
@@ -141,6 +143,8 @@ def _run_migrations() -> None:
         ("mail_account", "access_token_expire_time", "INTEGER DEFAULT 0"),
         ("mail_account", "cached_access_token_graph", "TEXT DEFAULT ''"),
         ("mail_account", "cached_access_token_imap", "TEXT DEFAULT ''"),
+        ("mail_account", "cached_access_token_graph_expire_time", "INTEGER DEFAULT 0"),
+        ("mail_account", "cached_access_token_imap_expire_time", "INTEGER DEFAULT 0"),
     ]
 
     conn = sqlite3.connect(DATABASE_PATH)
@@ -314,6 +318,16 @@ def ensure_mail_account_schema() -> None:
             conn.exec_driver_sql("ALTER TABLE mail_account ADD COLUMN protocol TEXT NOT NULL DEFAULT 'auto'")
         if "last_used_protocol" not in columns:
             conn.exec_driver_sql("ALTER TABLE mail_account ADD COLUMN last_used_protocol TEXT NOT NULL DEFAULT ''")
+        if "oauth_mode" not in columns:
+            conn.exec_driver_sql("ALTER TABLE mail_account ADD COLUMN oauth_mode TEXT NOT NULL DEFAULT ''")
+        conn.exec_driver_sql(
+            "UPDATE mail_account SET cached_access_token_graph_expire_time = access_token_expire_time "
+            "WHERE cached_access_token_graph_expire_time = 0 AND cached_access_token_graph != ''"
+        )
+        conn.exec_driver_sql(
+            "UPDATE mail_account SET cached_access_token_imap_expire_time = access_token_expire_time "
+            "WHERE cached_access_token_imap_expire_time = 0 AND cached_access_token_imap != ''"
+        )
         if "mail_server" not in columns:
             conn.exec_driver_sql("ALTER TABLE mail_account ADD COLUMN mail_server TEXT NOT NULL DEFAULT ''")
         if "mail_port" not in columns:
@@ -747,6 +761,14 @@ def _fetch_mails_by_email(
     if folder not in ("inbox", "junk"):
         folder = "inbox"
     limit = max(1, min(int(limit or 20), 100))
+    effective_protocol = (account.protocol or "auto").strip().lower()
+    if effective_protocol == "auto":
+        effective_protocol = (account.last_used_protocol or "").strip().lower()
+    if unseen_only and effective_protocol == "pop3":
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "unseen_unsupported", "message": "POP3 不提供可靠的已读状态，请改用 Graph 或 IMAP"},
+        )
 
     # 提取验证码时同时检查收件箱与垃圾邮件
     refresh_folders = ("inbox", "junk") if extract_code else (folder,)
@@ -850,18 +872,30 @@ _MAX_BATCH_EMAILS = 50
 
 def _batch_fetch_mails_by_email(db: Session, body: ByEmailBatchBody) -> dict:
     emails = [e for e in (body.emails or [])][: _MAX_BATCH_EMAILS]
-    results = []
-    for email in emails:
+    results: list[dict | None] = [None] * len(emails)
+
+    def fetch_one(index: int, email: str) -> tuple[int, dict]:
         try:
-            results.append(_fetch_mails_by_email(
-                db, email, body.folder, body.limit, body.force, timeout=55,
-                since=body.since, unseen_only=body.unseen_only,
-                extract_code=body.extract_code, code_since_ms=body.code_since_ms,
-            ))
+            with SessionLocal() as worker_db:
+                value = _fetch_mails_by_email(
+                    worker_db, email, body.folder, body.limit, body.force, timeout=55,
+                    since=body.since, unseen_only=body.unseen_only,
+                    extract_code=body.extract_code, code_since_ms=body.code_since_ms,
+                )
+                return index, value
         except HTTPException as exc:
             detail = exc.detail if isinstance(exc.detail, dict) else {"message": str(exc.detail)}
-            results.append({"email": email, "error": detail, "status_code": exc.status_code})
-    return {"results": results, "total": len(emails), "returned": len(results)}
+            return index, {"email": email, "error": detail, "status_code": exc.status_code}
+        except Exception as exc:  # noqa: BLE001
+            return index, {"email": email, "error": {"message": str(exc)[:200]}, "status_code": 500}
+
+    with ThreadPoolExecutor(max_workers=min(8, len(emails) or 1)) as executor:
+        futures = [executor.submit(fetch_one, index, email) for index, email in enumerate(emails)]
+        for future in as_completed(futures):
+            index, value = future.result()
+            results[index] = value
+    final_results = [item for item in results if item is not None]
+    return {"results": final_results, "total": len(emails), "returned": len(final_results)}
 
 
 @app.post("/api/automation/mails/batch-by-email", dependencies=[Depends(require_automation_api_key)])
@@ -1232,12 +1266,20 @@ def import_accounts(body: ImportBody, db: Session = Depends(get_db)):
         else:
             account.password = password
             account.client_id = client_id
+            account.valid_status = 1
             # 仅当 refresh_token 实际变化时才清空已缓存的 access_token,
             # 避免已可用的 token 被无谓重置 → 首次取件时还要重新刷新
             if (account.refresh_token or "") != refresh_token:
                 account.refresh_token = refresh_token
                 account.cached_access_token = ""
+                account.cached_access_token_graph = ""
+                account.cached_access_token_imap = ""
                 account.access_token_expire_time = 0
+                account.cached_access_token_graph_expire_time = 0
+                account.cached_access_token_imap_expire_time = 0
+                account.oauth_mode = ""
+                from mail_service import clear_graph_401
+                clear_graph_401(account)
             else:
                 account.refresh_token = refresh_token
             account.protocol = line_protocol
@@ -1538,13 +1580,14 @@ def get_account_mails(
     cached = get_mail_cache(db, account_id, folder)
 
     # 2. 有缓存 → 立即返回秒出 + 后台异步拉取最新
-    if cached and cached["items"]:
-        # 触发后台刷新（自动去重：若已有刷新在进行则复用，不会启动新线程）
-        refresh_mail_cache_async(account_id, folder, limit)
+    if cached is not None:
+        task = None
+        if not cached["is_fresh"]:
+            task = refresh_mail_cache_async(account_id, folder, limit)
 
         # 如果调用方要求等待最新结果，阻塞最多 30 秒等后台刷新完成
         refreshed_at = cached["updated_at"]
-        if wait:
+        if wait and task is not None:
             task = wait_for_refresh(account_id, folder, timeout=30)
             # 关键：后台 worker 用的是独立 session 写入数据库
             # 当前 db session 缓存了旧的对象，必须 expire_all 才能重新查询拿到新数据
@@ -1582,7 +1625,7 @@ def get_account_mails(
         task = wait_for_refresh(account_id, folder, timeout=30)
         db.expire_all()
         cached_after = get_mail_cache(db, account_id, folder)
-        if cached_after and cached_after["items"]:
+        if cached_after is not None:
             return {
                 "items": _list_items_view(cached_after),
                 "cached": True,
@@ -1715,12 +1758,15 @@ def get_account_mail_detail(
         raise HTTPException(status_code=404, detail="account not found")
 
     try:
-        # 1. 优先命中缓存中已拉取过正文的邮件，避免重复网络取件（已获取邮件一直保留在缓存中）
+        # 1. 优先命中缓存中「已拉取过正文」的邮件，避免重复网络取件
+        #    注意必须用 is_body_missing 判断：列表取件不带正文，
+        #    历史上 Graph 列表还会写入占位符 "<p>No content</p>"，
+        #    若只用 body 非空判断，会把占位符当成有效正文永久命中脏缓存。
         cached = get_mail_cache(db, account_id, folder)
         if cached and cached.get("items"):
             for item in cached["items"]:
-                if item.get("id") == mail_id and (item.get("body") or "").strip():
-                    return item
+                if item.get("id") == mail_id and not is_body_missing(item.get("body")):
+                    return {**item, "body_status": "loaded"}
 
         # 2. 缓存未命中（或正文尚未拉取）→ 网络取件
         mail_detail = load_single_mail_with_protocol(account, db, mail_id=mail_id, folder=folder)
@@ -1728,25 +1774,21 @@ def get_account_mail_detail(
             raise HTTPException(status_code=404, detail="mail not found")
 
         # 3. 把刚取到的正文写回缓存，使后续打开该邮件可秒出（增量刷新也会复用这条缓存）
-        if cached and cached.get("items"):
-            updated = False
-            for item in cached["items"]:
-                if item.get("id") == mail_id:
-                    item["body"] = mail_detail.get("body", "")
-                    item["html"] = mail_detail.get("html", item.get("html"))
-                    item["attachments"] = mail_detail.get("attachments", item.get("attachments"))
-                    updated = True
-                    break
-            if updated:
-                try:
-                    # save_mail_cache 仅接受 (db, account_id, folder, mails) 四个参数，
-                    # mail_count/updated_at 由函数自行计算，is_fresh 由 TTL 重新推导，无需在此传入
-                    save_mail_cache(db, account_id, folder, cached["items"])
-                except Exception as cache_exc:  # noqa: BLE001
-                    logger.warning("写回邮件正文缓存失败 account=%d mail=%s: %s",
-                                   account_id, mail_id, cache_exc)
+        #    只有真的取到正文才写回，避免把空正文/占位符固化进缓存。
+        if not is_body_missing(mail_detail.get("body")):
+            try:
+                update_mail_body(db, account_id, folder, mail_id, mail_detail)
+            except Exception as cache_exc:  # noqa: BLE001
+                logger.warning("写回邮件正文缓存失败 account=%d mail=%s: %s",
+                               account_id, mail_id, cache_exc)
 
-        return mail_detail
+        body = (mail_detail.get("body") or "").strip().casefold()
+        return {
+            **mail_detail,
+            "body_status": "empty" if body == "<p>no content</p>" else (
+                "missing" if is_body_missing(mail_detail.get("body")) else "loaded"
+            ),
+        }
     except MailServiceError as exc:
         raise HTTPException(status_code=400, detail=exc.message)
 

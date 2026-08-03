@@ -29,6 +29,15 @@ _refresh_lock = threading.Lock()
 # 但异步任务轮询仍需要读到结果（尤其失败时的 error），因此单独持久保存。
 # 键为 (account_id, folder)，天然按账号+文件夹去重，数量有限，无需额外清理。
 _refresh_last_result: dict[tuple[int, str], dict] = {}
+_refresh_generation: dict[tuple[int, str], int] = {}
+_cache_locks_guard = threading.Lock()
+_cache_locks: dict[tuple[int, str], threading.RLock] = {}
+
+
+def _cache_lock(account_id: int, folder: str) -> threading.RLock:
+    key = (account_id, folder)
+    with _cache_locks_guard:
+        return _cache_locks.setdefault(key, threading.RLock())
 
 # 后台刷新看门狗：若单次刷新超过该秒数仍未完成（如网络卡死），强制将刷新任务标记为结束，
 # 避免 is_refreshing 永远为 True 导致前端一直显示"正在拉取最新邮件"。
@@ -55,34 +64,79 @@ class RefreshTask:
         self.event.set()
 
 
-def save_mail_cache(db: Session, account_id: int, folder: str, mails: list) -> None:
-    """保存邮件到缓存表"""
+def merge_preserve_bodies(new_items: list, old_items: list | None) -> list:
+    """用新列表覆盖缓存前，把旧缓存里「已经取到的正文」保留下来。
+
+    背景：列表取件为省流量不带正文，正文是用户点开邮件时由详情接口单独拉取
+    并写回缓存的。若后台刷新直接用新列表整体覆盖，这些已拉取的正文就被抹掉了，
+    表现为「刚看过有内容的邮件，一刷新又变成空白」。
+    这里按 id 对齐：新项正文缺失、而旧缓存有正文时，沿用旧正文。
+    """
+    from mail_service import is_body_missing
+
+    if not old_items:
+        return new_items
+
+    old_map = {}
+    for item in old_items:
+        if isinstance(item, dict) and item.get("id"):
+            old_map[item["id"]] = item
+            if item.get("message_id"):
+                old_map[item["message_id"]] = item
+
+    for item in new_items or []:
+        if not isinstance(item, dict):
+            continue
+        if not is_body_missing(item.get("body")):
+            continue  # 新项自带正文，无需回填
+        old = old_map.get(item.get("id")) or old_map.get(item.get("message_id"))
+        if old is None:
+            continue
+        if not is_body_missing(old.get("body")):
+            item["body"] = old.get("body")
+            for extra in ("html", "attachments"):
+                if old.get(extra) is not None and item.get(extra) is None:
+                    item[extra] = old.get(extra)
+    return new_items
+
+
+def save_mail_cache(
+    db: Session,
+    account_id: int,
+    folder: str,
+    mails: list,
+    touch_timestamp: bool = True,
+) -> None:
+    """保存邮件到缓存表。
+
+    touch_timestamp=False 时不更新 updated_at：用于「详情接口写回单封正文」
+    这类局部更新，避免把列表缓存的 TTL 续命，导致 is_fresh 误判为新鲜、
+    前端不再触发真正的列表刷新。
+    """
     from models import MailCache
 
-    now = int(time.time())
-    mails_json = json.dumps(mails, ensure_ascii=False, default=str)
-
-    existing = (
-        db.query(MailCache)
-        .filter(MailCache.account_id == account_id, MailCache.folder == folder)
-        .first()
-    )
-
-    if existing:
-        existing.mails_json = mails_json
-        existing.mail_count = len(mails)
-        existing.updated_at = now
-    else:
-        cache = MailCache(
-            account_id=account_id,
-            folder=folder,
-            mails_json=mails_json,
-            mail_count=len(mails),
-            updated_at=now,
+    with _cache_lock(account_id, folder):
+        now = int(time.time())
+        mails_json = json.dumps(mails, ensure_ascii=False, default=str)
+        existing = (
+            db.query(MailCache)
+            .filter(MailCache.account_id == account_id, MailCache.folder == folder)
+            .first()
         )
-        db.add(cache)
-
-    db.commit()
+        if existing:
+            existing.mails_json = mails_json
+            existing.mail_count = len(mails)
+            if touch_timestamp:
+                existing.updated_at = now
+        else:
+            db.add(MailCache(
+                account_id=account_id,
+                folder=folder,
+                mails_json=mails_json,
+                mail_count=len(mails),
+                updated_at=now,
+            ))
+        db.commit()
 
 
 def get_mail_cache(db: Session, account_id: int, folder: str) -> dict | None:
@@ -116,6 +170,45 @@ def get_mail_cache(db: Session, account_id: int, folder: str) -> dict | None:
         "is_fresh": is_fresh,
         "count": cache.mail_count,
     }
+
+
+def update_mail_body(
+    db: Session,
+    account_id: int,
+    folder: str,
+    mail_id: str,
+    detail: dict,
+) -> bool:
+    """把详情接口刚拉到的单封正文写回缓存（局部更新，不动列表 TTL）。
+
+    写回前重新读一次缓存，尽量缩小与后台刷新线程之间的读改写竞态窗口
+    （MailCache 是整个文件夹一个 JSON 大字段，只能整体覆盖）。
+    返回是否命中并更新了该封邮件。
+    """
+    if not mail_id or not isinstance(detail, dict):
+        return False
+
+    with _cache_lock(account_id, folder):
+        db.expire_all()
+        cached = get_mail_cache(db, account_id, folder)
+        items = (cached or {}).get("items") or []
+        if not items:
+            return False
+        updated = False
+        for item in items:
+            if not isinstance(item, dict) or item.get("id") != mail_id:
+                continue
+            body = detail.get("body")
+            if body is not None:
+                item["body"] = body
+            for extra in ("html", "attachments"):
+                if detail.get(extra) is not None:
+                    item[extra] = detail[extra]
+            updated = True
+            break
+        if updated:
+            save_mail_cache(db, account_id, folder, items, touch_timestamp=False)
+        return updated
 
 
 def is_refreshing(account_id: int, folder: str) -> bool:
@@ -201,19 +294,15 @@ def refresh_mail_cache_async(
 
     key = (account_id, folder)
 
-    # 已有刷新在进行？复用同一任务
-    if not force:
-        with _refresh_lock:
-            existing = _refresh_tasks.get(key)
-            if existing is not None:
-                return existing
-
-    # 注册新任务
-    task = RefreshTask()
     with _refresh_lock:
-        if force and key in _refresh_tasks:
-            # 让等待旧任务的人立刻返回（避免悬空等待）
-            _refresh_tasks[key].event.set()
+        existing = _refresh_tasks.get(key)
+        if existing is not None and not force:
+            return existing
+        task = RefreshTask()
+        generation = _refresh_generation.get(key, 0) + 1
+        _refresh_generation[key] = generation
+        if existing is not None:
+            existing.done(error="已被新的强制刷新取代", item_count=-1)
         _refresh_tasks[key] = task
 
     def _watchdog() -> None:
@@ -221,6 +310,15 @@ def refresh_mail_cache_async(
         # 防止 is_refreshing 永远为 True 导致前端一直显示"正在拉取最新邮件"。
         if not task.event.is_set():
             task.done(error="刷新超时(看门狗)", item_count=-1)
+            with _refresh_lock:
+                if _refresh_tasks.get(key) is task:
+                    _refresh_generation[key] = generation + 1
+                    _refresh_tasks.pop(key, None)
+                    _refresh_last_result[key] = {
+                        "error": task.error,
+                        "item_count": -1,
+                        "ts": time.time(),
+                    }
 
     watchdog = threading.Timer(REFRESH_WATCHDOG_SECONDS, _watchdog)
     watchdog.daemon = True
@@ -273,8 +371,22 @@ def refresh_mail_cache_async(
                         logger.info("账号 %d 在刷新过程中被删除，跳过保存缓存", account_id)
                         error_msg = "account deleted during refresh"
                     else:
-                        save_mail_cache(db, account_id, folder, items)
-                        item_count = len(items)
+                        # 覆盖前重新读一次缓存并回填正文：
+                        # 取件期间用户可能刚点开过某封邮件，详情接口已把正文写回缓存，
+                        # 若直接用不含正文的新列表整体覆盖，那份正文就丢了。
+                        with _refresh_lock:
+                            still_current = _refresh_generation.get(key) == generation
+                        if not still_current:
+                            error_msg = "刷新结果已过期，跳过保存"
+                        else:
+                            with _cache_lock(account_id, folder):
+                                db.expire_all()
+                                latest = get_mail_cache(db, account_id, folder)
+                                items = merge_preserve_bodies(
+                                    items, (latest or {}).get("items")
+                                )
+                                save_mail_cache(db, account_id, folder, items)
+                            item_count = len(items)
                         logger.info(
                             "后台刷新邮件缓存完成: account=%d folder=%s (%d封)",
                             account_id, folder, item_count,
@@ -301,13 +413,12 @@ def refresh_mail_cache_async(
             watchdog.cancel()
             task.done(error=error_msg, item_count=item_count)
             with _refresh_lock:
-                # 持久保存最近一次结果（含错误），供任务出队后轮询仍可读到
-                _refresh_last_result[key] = {
-                    "error": error_msg,
-                    "item_count": item_count,
-                    "ts": time.time(),
-                }
-                # 只有当前注册的还是我们的 task 时才清理
+                if _refresh_generation.get(key) == generation:
+                    _refresh_last_result[key] = {
+                        "error": error_msg,
+                        "item_count": item_count,
+                        "ts": time.time(),
+                    }
                 if _refresh_tasks.get(key) is task:
                     _refresh_tasks.pop(key, None)
 
@@ -345,7 +456,14 @@ def refresh_mail_cache_sync(
             if not account:
                 return False, "account not found"
             items = load_account_mails(account, db, folder=folder, limit=limit)
-            save_mail_cache(db, account_id, folder, items)
+            key = (account_id, folder)
+            with _refresh_lock:
+                _refresh_generation[key] = _refresh_generation.get(key, 0) + 1
+            with _cache_lock(account_id, folder):
+                db.expire_all()
+                previous = get_mail_cache(db, account_id, folder)
+                items = merge_preserve_bodies(items, (previous or {}).get("items"))
+                save_mail_cache(db, account_id, folder, items)
             logger.info(
                 "同步刷新邮件缓存完成: account=%d folder=%s (%d封)",
                 account_id, folder, len(items),

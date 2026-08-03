@@ -1671,9 +1671,8 @@ function renderMailDetail() {
         return;
     }
 
-    const bodyText = (currentMail.body || "").trim();
     let bodyRender;
-    if (!bodyText) {
+    if (isBodyMissing(currentMail.body)) {
         const loading =
             pendingMailBodyId != null &&
             getMailId(pendingMailBodyId) === getMailId(state.selectedMailId);
@@ -1713,30 +1712,73 @@ function renderMailDetail() {
     updateMailMobileView();
 }
 
+// 后端占位符：表示「拉取过但这封邮件确实没有正文」，与「尚未拉取」要区分开。
+const NO_CONTENT_PLACEHOLDER = "<p>no content</p>";
+
+// 判断正文是否「尚未取到」，需与后端 mail_service.is_body_missing 保持一致。
+function isBodyMissing(body) {
+    const content = (body || "").trim();
+    if (!content) return true;
+    return content.toLowerCase() === NO_CONTENT_PLACEHOLDER;
+}
+
+function isConfirmedEmptyBody(body, status) {
+    return status === "empty"
+        || (body || "").trim().toLowerCase() === NO_CONTENT_PLACEHOLDER;
+}
+
+// 拼出详情接口地址。必须带上 folder：后端默认按 inbox 查，
+// 不传的话垃圾箱里的邮件永远定位不到，详情恒为空。
+function mailDetailUrl(accountId, mailId, folder) {
+    const target = folder || state.loadedMailFolder || state.selectedFolder || "inbox";
+    return `/api/accounts/${accountId}/mails/${encodeURIComponent(mailId)}`
+        + `?folder=${encodeURIComponent(target)}`;
+}
+
 // 列表接口已不再返回正文，打开邮件时需按需调用详情接口拉取正文。
 let pendingMailBodyId = null;
 let mailBodyLoadToken = 0;
+// 已确认「服务端也没有正文」的邮件，记下来避免每次渲染都重复请求
+// （15 秒自动刷新会反复触发 renderMails → loadMailBodyIntoState）。
+const emptyBodyMails = new Set();
+
 async function loadMailBodyIntoState(mailId) {
     const accountId = state.loadedMailAccountId;
     if (!accountId || mailId == null) return;
     const id = getMailId(mailId);
     const mail = state.mails.find((m) => getMailId(m.id) === id);
     if (!mail) return;
-    if ((mail.body || "").trim()) return; // 已有正文，无需重复请求
+    if (!isBodyMissing(mail.body)) return; // 已有正文，无需重复请求
+    const emptyKey = `${accountId}|${state.loadedMailFolder || "inbox"}|${id}`;
+    if (emptyBodyMails.has(emptyKey)) return; // 已确认是空邮件，不再重复请求
 
     const token = ++mailBodyLoadToken;
     pendingMailBodyId = id;
     renderMailDetail(); // 先显示“正在加载正文...”
     try {
-        const data = await api(`/api/accounts/${accountId}/mails/${encodeURIComponent(mailId)}`);
+        const data = await api(mailDetailUrl(accountId, mailId, state.loadedMailFolder));
         if (token !== mailBodyLoadToken) return; // 已切换到其它邮件，丢弃本次结果
         if (data && typeof data === "object") {
             if (data.body != null) mail.body = data.body;
             if (data.html != null) mail.html = data.html;
             if (data.attachments != null) mail.attachments = data.attachments;
         }
+        // 详情接口返回后如果正文仍然缺失（服务端确实没有正文），
+        // 记下来避免后续每次渲染都重复请求这封空邮件。
+        mail.bodyStatus = data?.body_status || mail.bodyStatus;
+        if (isConfirmedEmptyBody(mail.body, mail.bodyStatus)) {
+            emptyBodyMails.add(emptyKey);
+        }
     } catch (error) {
-        // 拉取失败不阻断界面，保留空正文占位
+        // 拉取失败不阻断界面，但要把原因告诉用户，
+        // 否则只看到"暂无内容"，无法区分是空邮件还是取件失败
+        if (token === mailBodyLoadToken) {
+            setMessage(
+                elements.mailMessage,
+                `邮件正文加载失败：${error?.message || error}`,
+                true,
+            );
+        }
     } finally {
         if (pendingMailBodyId != null && getMailId(pendingMailBodyId) === id) {
             pendingMailBodyId = null;
@@ -2054,7 +2096,31 @@ async function loadMails({ silent = false } = {}) {
 
 // 把后端返回的 mails 数据应用到 state 并重新渲染
 function updateMailsFromData(data, accountId, folder) {
-    state.mails = data.items || [];
+    const incoming = data.items || [];
+    // 列表接口不带正文。若直接整体替换 state.mails，已经打开过、
+    // 正文已加载的邮件会被打回空白（15 秒自动刷新下表现为正文闪烁消失）。
+    // 这里按 id 把本地已有的正文迁移到新列表上。
+    const sameView =
+        state.loadedMailAccountId === accountId && state.loadedMailFolder === folder;
+    if (sameView && state.mails.length) {
+        const bodyMap = new Map();
+        state.mails.forEach((mail) => {
+            if (mail && mail.id != null && !isBodyMissing(mail.body)) {
+                bodyMap.set(getMailId(mail.id), mail);
+            }
+        });
+        incoming.forEach((mail) => {
+            if (!mail || mail.id == null || !isBodyMissing(mail.body)) return;
+            const cached = bodyMap.get(getMailId(mail.id));
+            if (!cached) return;
+            mail.body = cached.body;
+            if (mail.html == null && cached.html != null) mail.html = cached.html;
+            if (mail.attachments == null && cached.attachments != null) {
+                mail.attachments = cached.attachments;
+            }
+        });
+    }
+    state.mails = incoming;
     state.loadedMailAccountId = accountId;
     state.loadedMailFolder = folder;
     syncMailEmptyState(text.emptyMailList, text.emptyMailDetail);
@@ -2918,11 +2984,11 @@ function extractCode(mail) {
 // 列表接口不返回正文，确保邮件正文已加载后再提取（命中缓存时详情接口秒回）。
 async function ensureMailBody(mail) {
     if (!mail) return mail;
-    if ((mail.body || "").trim()) return mail;
+    if (!isBodyMissing(mail.body)) return mail;
     const accountId = state.loadedMailAccountId;
     if (!accountId) return mail;
     try {
-        const data = await api(`/api/accounts/${accountId}/mails/${encodeURIComponent(mail.id)}`);
+        const data = await api(mailDetailUrl(accountId, mail.id, state.loadedMailFolder));
         if (data && typeof data === "object") {
             if (data.body != null) mail.body = data.body;
             if (data.html != null) mail.html = data.html;
@@ -3134,7 +3200,6 @@ elements.searchInput.addEventListener("input", () => {
     }
     renderAccounts();
 });
-elements.mailSearchInput.addEventListener("input", renderAccounts);
 elements.mailSearchInput.addEventListener("input", renderAccounts);
 elements.tagFilter.addEventListener("change", () => {
     // 切换标签筛选时清除之前的选中，避免旧选中残留导致导出数量多于预期

@@ -360,8 +360,7 @@ def _refresh_single_account(account_id: int) -> dict:
             db.commit()
 
             # 写入邮件缓存（供前端秒出）
-            if items:
-                save_mail_cache(db, account_id, "inbox", items)
+            save_mail_cache(db, account_id, "inbox", items)
 
             latest_mail = items[0] if items else None
             if latest_mail:
@@ -374,12 +373,16 @@ def _refresh_single_account(account_id: int) -> dict:
             else:
                 result["status"] = "empty"
         except MailServiceError as exc:
-            account.valid_status = 0
+            permanent_tags = {
+                "auth_missing", "missing_credentials_for_graph",
+                "missing_credentials_for_imap", "missing_credentials_for_pop3",
+            }
+            if exc.tag in permanent_tags:
+                account.valid_status = 0
             db.commit()
             result["error"] = exc.message
         except Exception as exc:
-            account.valid_status = 0
-            db.commit()
+            db.rollback()
             result["error"] = str(exc)[:200]
 
     return result

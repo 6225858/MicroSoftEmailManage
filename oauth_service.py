@@ -36,6 +36,70 @@ IMAP_SCOPES_RELAXED = "https://outlook.office.com/IMAP.AccessAsUser.All offline_
 MSAUTH_TOKEN_PREFIXES = ("M.C", "M.R", "EwA", "EwB")
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# 三种标准取件模式（新GR / 老GR / IMAP-OAuth2）
+# ──────────────────────────────────────────────────────────────────────────
+# 市面上流通的 Hotmail/Outlook refresh_token 按其注册应用授权的 scope 不同，
+# 分为三类，必须用「匹配的 scope」去 consumers 端点换 access_token，
+# 用错 scope 会直接被 Azure AD 拒绝（invalid_grant / unauthorized scope）。
+#
+#   • 新GR ：client_id 注册时授权了 Mail.Read 委托权限，用短格式 scope。
+#            适用于近年流通的 Graph 取件 token，可直接调 Graph API。
+#   • 老GR ：client_id 授权范围写死在应用注册里，用 .default 让 Azure AD
+#            返回该应用「全部已授权 scope」。注意 .default 不能与其它
+#            scope 混用（会报 AADSTS28000），因此这里单独发送、不带
+#            offline_access。
+#   • IMAP ：只授权了 Outlook IMAP 委托权限的 token，拿到的 access_token
+#            不能调 Graph，只能用于 IMAP/POP3 的 XOAUTH2 认证。
+#
+# 三者统一走 consumers 端点（个人版微软账号），按上述顺序自动兜底。
+# ══════════════════════════════════════════════════════════════════════════
+
+OAUTH_MODE_NEW_GR = "new_gr"
+OAUTH_MODE_OLD_GR = "old_gr"
+OAUTH_MODE_IMAP = "imap_oauth2"
+
+# 各模式对应的 scope（与参考实现逐字对齐，不要随意增删）
+NEW_GR_SCOPE = "User.Read Mail.Read offline_access"
+OLD_GR_SCOPE = "https://graph.microsoft.com/.default"
+IMAP_OAUTH_SCOPE = "https://outlook.office.com/IMAP.AccessAsUser.All offline_access"
+
+# 模式定义表：scope / 端点 / 该模式产出的 token 属于哪个用途槽位
+OAUTH_MODE_SPECS: dict[str, dict] = {
+    OAUTH_MODE_NEW_GR: {
+        "label": "新GR",
+        "scope": NEW_GR_SCOPE,
+        "token_url": TOKEN_URL_CONSUMER,
+        "slot": "graph",
+    },
+    OAUTH_MODE_OLD_GR: {
+        "label": "老GR",
+        "scope": OLD_GR_SCOPE,
+        "token_url": TOKEN_URL_CONSUMER,
+        "slot": "graph",
+    },
+    OAUTH_MODE_IMAP: {
+        "label": "IMAP",
+        "scope": IMAP_OAUTH_SCOPE,
+        "token_url": TOKEN_URL_CONSUMER,
+        "slot": "imap",
+    },
+}
+
+# Graph 用途的模式尝试顺序（新GR 优先，其次老GR）
+GRAPH_MODE_CHAIN = (OAUTH_MODE_NEW_GR, OAUTH_MODE_OLD_GR)
+# IMAP/POP3 用途的模式尝试顺序
+IMAP_MODE_CHAIN = (OAUTH_MODE_IMAP,)
+# 统一入口 auto_get_token 的完整兜底顺序：新GR → 老GR → IMAP
+AUTO_MODE_CHAIN = (OAUTH_MODE_NEW_GR, OAUTH_MODE_OLD_GR, OAUTH_MODE_IMAP)
+
+
+def get_oauth_mode_label(mode: str) -> str:
+    """返回模式的中文名，用于日志与前端展示。"""
+    spec = OAUTH_MODE_SPECS.get(mode or "")
+    return spec["label"] if spec else "未知"
+
+
 logger = logging.getLogger(__name__)
 if not logger.handlers:
     handler = logging.StreamHandler()
@@ -292,6 +356,203 @@ def _try_oauth2_refresh(
     raise last_error or OAuthServiceError("unknown OAuth2 refresh error")
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# 三种取件模式的具体实现
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def _payload_granted_scope(payload: dict) -> str:
+    return str(payload.get("scope", "") or "").lower()
+
+
+def _scope_has_graph_mail(payload: dict) -> bool:
+    """判断该 payload 的 token 是否真的具备 Graph 读信权限。
+
+    .default 模式下 Azure AD 会把应用注册时授权的全部 scope 原样返回，
+    因此这里做关键字包含判断即可。部分端点不返回 scope 字段（空串），
+    此时无法判定，交由调用方按「宽松」策略处理。
+    """
+    granted = _payload_granted_scope(payload)
+    return "mail.read" in granted or "mail.readwrite" in granted
+
+
+def _scope_has_imap(payload: dict) -> bool:
+    """判断该 payload 的 token 是否具备 IMAP/POP3 XOAUTH2 权限。"""
+    granted = _payload_granted_scope(payload)
+    return "imap" in granted or "pop" in granted or "wl.imap" in granted
+
+
+def request_token_by_mode(
+    account: MailAccount,
+    mode: str,
+    proxies: dict | None = None,
+) -> dict:
+    """按指定模式（新GR / 老GR / IMAP）换取 access_token。
+
+    对应参考实现中的 getNewGRToken / getOldGRToken / getImapToken 三个函数：
+    统一 POST 到 consumers 端点，区别只在 scope。成功返回完整的 OAuth2
+    响应 payload（含 access_token / refresh_token / expires_in / scope），
+    失败抛出 OAuthServiceError。
+    """
+    spec = OAUTH_MODE_SPECS.get(mode)
+    if not spec:
+        raise OAuthServiceError(f"未知的取件模式: {mode}")
+
+    label = spec["label"]
+    cleaned_token = _sanitize_token(account.refresh_token)
+    client_id = (account.client_id or "").strip()
+    if not cleaned_token:
+        raise OAuthServiceError(f"{label} 模式缺少 refresh_token")
+    if not client_id:
+        raise OAuthServiceError(f"{label} 模式缺少 client_id")
+
+    request_data = {
+        "client_id": client_id,
+        "grant_type": "refresh_token",
+        "refresh_token": cleaned_token,
+        "scope": spec["scope"],
+    }
+
+    try:
+        response = _post_with_retry(
+            spec["token_url"],
+            data=request_data,
+            timeout=20,
+            proxies=proxies,
+            account_id=account.id,
+        )
+    except requests.RequestException as exc:
+        raise OAuthServiceError(f"{label} 模式网络错误: {exc}") from exc
+
+    if not response.ok:
+        detail = ""
+        try:
+            error_payload = response.json()
+            detail = (
+                error_payload.get("error_description")
+                or error_payload.get("error")
+                or ""
+            )
+        except Exception:
+            detail = response.text[:300]
+        raise OAuthServiceError(f"{label} 模式 HTTP {response.status_code}: {detail}")
+
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise OAuthServiceError(f"{label} 模式响应解析失败: {exc}") from exc
+
+    if payload.get("error"):
+        raise OAuthServiceError(
+            f"{label} 模式返回错误: "
+            f"{payload.get('error_description') or payload['error']}"
+        )
+    if not payload.get("access_token"):
+        raise OAuthServiceError(f"{label} 模式响应缺少 access_token")
+
+    return payload
+
+
+def get_new_gr_token(account: MailAccount, proxies: dict | None = None) -> dict:
+    """新GR 专用：scope = User.Read Mail.Read offline_access"""
+    return request_token_by_mode(account, OAUTH_MODE_NEW_GR, proxies)
+
+
+def get_old_gr_token(account: MailAccount, proxies: dict | None = None) -> dict:
+    """老GR 专用：scope = https://graph.microsoft.com/.default"""
+    return request_token_by_mode(account, OAUTH_MODE_OLD_GR, proxies)
+
+
+def get_imap_oauth_token(account: MailAccount, proxies: dict | None = None) -> dict:
+    """IMAP 专用：scope = https://outlook.office.com/IMAP.AccessAsUser.All offline_access"""
+    return request_token_by_mode(account, OAUTH_MODE_IMAP, proxies)
+
+
+def auto_get_token(
+    account: MailAccount,
+    proxies: dict | None = None,
+    modes: tuple | list | None = None,
+    verify_scope: bool = True,
+) -> tuple[str, dict]:
+    """统一入口：按顺序自动三模式兜底，返回 (成功的模式, OAuth2 payload)。
+
+    对应参考实现中的 autoGetMail。默认顺序 新GR → 老GR → IMAP。
+
+    verify_scope=True 时做两轮：
+      第一轮要求「拿到的 token 确实含该模式期望的权限」，
+      避免某些 client_id 刷新成功却返回一个没有读信权限的 token
+      （这种 token 调 Graph 必 401，属于假成功）；
+      第一轮全部落空后，第二轮放宽校验，接受任意刷新成功的 token，
+      让上层协议链自己去试（与参考实现的宽松行为一致）。
+
+    若账号记录过上次成功的模式（oauth_mode），该模式会被提到最前面优先尝试。
+    """
+    chain = list(modes) if modes else list(AUTO_MODE_CHAIN)
+
+    # 上次成功的模式优先，省掉重复的失败尝试
+    remembered = (getattr(account, "oauth_mode", "") or "").strip()
+    if remembered in chain:
+        chain = [remembered] + [m for m in chain if m != remembered]
+
+    last_error: OAuthServiceError | None = None
+    relaxed_hit: tuple[str, dict] | None = None
+
+    for mode in chain:
+        spec = OAUTH_MODE_SPECS[mode]
+        try:
+            payload = request_token_by_mode(account, mode, proxies)
+        except OAuthServiceError as exc:
+            last_error = exc
+            _oauth_log(
+                logging.WARNING,
+                account_id=account.id,
+                endpoint=spec["token_url"],
+                attempt=1,
+                tag="refresh_failed",
+            )
+            continue
+
+        if not verify_scope:
+            return mode, payload
+
+        # 校验拿到的 token 是否具备该模式应有的权限
+        if spec["slot"] == "imap":
+            ok = _scope_has_imap(payload)
+        else:
+            ok = _scope_has_graph_mail(payload)
+
+        if ok:
+            _oauth_log(
+                logging.INFO,
+                account_id=account.id,
+                endpoint=spec["token_url"],
+                attempt=1,
+                tag="refresh_succeeded",
+            )
+            return mode, payload
+
+        # 刷新成功但权限存疑：先记下来，等严格轮全部落空再用
+        if relaxed_hit is None:
+            relaxed_hit = (mode, payload)
+        last_error = OAuthServiceError(
+            f"{spec['label']} 模式刷新成功但 token 缺少预期权限"
+            f"（实际 scope: {_payload_granted_scope(payload)[:100] or '未返回'}）"
+        )
+
+    if relaxed_hit is not None:
+        # 第二轮：放宽校验，接受刷新成功但 scope 存疑的 token
+        _oauth_log(
+            logging.INFO,
+            account_id=account.id,
+            endpoint=OAUTH_MODE_SPECS[relaxed_hit[0]]["token_url"],
+            attempt=2,
+            tag="refresh_succeeded",
+        )
+        return relaxed_hit
+
+    raise last_error or OAuthServiceError("三种取件模式均失败")
+
+
 def _try_msauth_refresh(account: MailAccount, proxies: dict | None) -> dict:
     """
     MSAuth 端点刷新（login.live.com）。
@@ -404,7 +665,7 @@ def _try_msauth_refresh(account: MailAccount, proxies: dict | None) -> dict:
     raise last_error or OAuthServiceError("MSAuth refresh failed (unknown)")
 
 
-def _store_tokens(account: MailAccount, db: Session, access_token: str, new_refresh_token: str, now: int, expires_in: int | None = None, scope_slot: str = "graph") -> None:
+def _store_tokens(account: MailAccount, db: Session, access_token: str, new_refresh_token: str, now: int, expires_in: int | None = None, scope_slot: str = "graph", oauth_mode: str = "") -> None:
     old_refresh_token = _sanitize_token(account.refresh_token)
 
     if new_refresh_token and new_refresh_token != old_refresh_token:
@@ -435,10 +696,16 @@ def _store_tokens(account: MailAccount, db: Session, access_token: str, new_refr
     # 按 scope 隔离持久化，修复 graph / imap 刷新互相覆盖的历史问题
     if scope_slot == "imap":
         account.cached_access_token_imap = access_token
+        account.cached_access_token_imap_expire_time = now + cache_seconds
     else:
         account.cached_access_token_graph = access_token
+        account.cached_access_token_graph_expire_time = now + cache_seconds
     account.cached_access_token = access_token  # 旧字段保留以兼容
     account.access_token_expire_time = now + cache_seconds
+    # 记录本次成功的取件模式（新GR / 老GR / IMAP），下次刷新优先复用，
+    # 避免每次都从头把三种模式挨个试一遍
+    if oauth_mode and getattr(account, "oauth_mode", None) != oauth_mode:
+        account.oauth_mode = oauth_mode
     db.commit()
     db.refresh(account)
 
@@ -476,7 +743,12 @@ def _seed_token_cache_from_db(account: MailAccount, now: int, scope_slot: str) -
     cached = _sanitize_token(getattr(account, col, "") or "")
     if not cached:
         return None
-    expire = account.access_token_expire_time or 0
+    expire_col = (
+        "cached_access_token_graph_expire_time"
+        if scope_slot == "graph"
+        else "cached_access_token_imap_expire_time"
+    )
+    expire = getattr(account, expire_col, 0) or 0
     if expire <= now:
         return None
     ttl = expire - now
@@ -524,13 +796,13 @@ def get_valid_access_token(
     last_error: OAuthServiceError | None = None
     is_msauth = _is_msauth_token(account.refresh_token)
 
-    def persist(payload: dict) -> str:
+    def persist(payload: dict, oauth_mode: str = "") -> str:
         access_token = payload["access_token"]
         new_refresh_token = _sanitize_token(str(payload.get("refresh_token") or ""))
         expires_in = payload.get("expires_in")
         _store_tokens(account, db, access_token, new_refresh_token, now,
                       expires_in=int(expires_in) if expires_in else None,
-                      scope_slot=scope_slot)
+                      scope_slot=scope_slot, oauth_mode=oauth_mode)
         # 缓存有效期：用 OAuth 响应中的 expires_in（留 5 分钟缓冲），否则 fallback 50 分钟
         if expires_in and expires_in > 300:
             ttl = expires_in - 300
@@ -539,8 +811,33 @@ def get_valid_access_token(
         _token_cache_set(account.id, scope_slot, access_token, ttl)
         return access_token
 
+    def try_mode_chain(mode_chain) -> str | None:
+        """先走「新GR / 老GR / IMAP」三模式标准链，成功则直接返回 access_token。
+
+        这是与参考实现对齐的首选路径：scope 精确、端点统一（consumers），
+        且会把成功的模式记到 account.oauth_mode，下次优先复用。
+        M.C / EwA 等 MSAuth 格式 token 走不通 consumers 端点，跳过以免白等。
+        """
+        nonlocal last_error
+        if is_msauth:
+            return None
+        try:
+            mode, payload = auto_get_token(account, proxies, modes=mode_chain)
+        except OAuthServiceError as exc:
+            last_error = exc
+            return None
+        logger.info(
+            "oauth account_id=%s 取件模式=%s 命中",
+            getattr(account, "id", 0), get_oauth_mode_label(mode),
+        )
+        return persist(payload, oauth_mode=mode)
+
     if scope_slot == "imap":
         # ── IMAP / POP3 XOAUTH2 ──
+        # 首选：IMAP 专用 scope（参考实现的第三种模式）
+        token = try_mode_chain(IMAP_MODE_CHAIN)
+        if token:
+            return token
         if is_msauth:
             # M.C 个人版 token：优先 MSAuth 端点刷新出 wl.imap token（IMAP 唯一可靠路径）
             _oauth_log(
@@ -602,6 +899,11 @@ def get_valid_access_token(
                     )
     else:
         # ── Graph API（需要 Mail.Read）──
+        # 首选：新GR → 老GR 两种标准模式（参考实现的前两种）
+        token = try_mode_chain(GRAPH_MODE_CHAIN)
+        if token:
+            return token
+        # 兜底：历史多 scope 探测逻辑（覆盖非标准 client_id）
         for attempt_idx, token_url in enumerate((TOKEN_URL_CONSUMER, TOKEN_URL_COMMON), start=1):
             try:
                 payload = _try_oauth2_refresh(token_url, account, proxies, relax_scope_check=False)
@@ -635,7 +937,12 @@ def get_valid_access_token(
     # 否则 Graph 请求拿到 IMAP token 会 401，被误报为 token_invalid；也不要返回已过期 token。
     col = "cached_access_token_graph" if scope_slot == "graph" else "cached_access_token_imap"
     same_scope = _sanitize_token(getattr(account, col, "") or "")
-    if same_scope and (account.access_token_expire_time or 0) > now + 30:
+    expire_col = (
+        "cached_access_token_graph_expire_time"
+        if scope_slot == "graph"
+        else "cached_access_token_imap_expire_time"
+    )
+    if same_scope and (getattr(account, expire_col, 0) or 0) > now + 30:
         return same_scope
     # 没有可用的同 scope token：如实抛出刷新错误，让协议链正确回退 / 报出真实原因，
     # 而不是返回一个过期或错 scope 的 token 导致 401 -> 误导性的 token_invalid。

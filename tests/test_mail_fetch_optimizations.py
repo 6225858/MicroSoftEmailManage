@@ -34,21 +34,23 @@ class _FakeListIMAP:
     def select(self, *a, **k):
         return ("OK", [b"1"])
 
-    def search(self, *a, **k):
-        return ("OK", [b"1 2 3"])
+    def response(self, name):
+        return ("UIDVALIDITY", [b"123"])
 
-    def fetch(self, *a, **k):
+    def uid(self, command, *a):
+        if command == "search":
+            return ("OK", [b"1 2 3"])
         self.fetch_args = a
         ids = a[0].split(",")
         chunks = []
-        for i, _uid in enumerate(ids, start=1):
+        for i, uid in enumerate(ids, start=1):
             header = (
                 b"From: a@example.com\r\n"
                 b"Subject: Subj " + str(i).encode() + b"\r\n"
                 b"Message-ID: <m" + str(i).encode() + b"@e.com>\r\n"
                 b"Date: Mon, 01 Jan 2024 00:00:00 +0000\r\n"
             )
-            chunks.append((f"{i} FETCH (BODY[HEADER] {{0}}".encode(), header))
+            chunks.append((f"{i} FETCH (UID {uid} FLAGS (\\Seen) BODY[HEADER] {{0}}".encode(), header))
         return ("OK", chunks)
 
     def logout(self, *a, **k):
@@ -99,12 +101,13 @@ class TestMailFetchOptimizations(unittest.TestCase):
 
         # 仅一次批量 fetch，且只拉邮件头，不拉 RFC822
         self.assertIsNotNone(fake.fetch_args)
-        self.assertEqual(fake.fetch_args[1], "(BODY.PEEK[HEADER])")
+        self.assertEqual(fake.fetch_args[1], "(BODY.PEEK[HEADER] FLAGS)")
         self.assertEqual(len(items), 3)
         for item in items:
             # 列表不返回正文，减小体积
             self.assertEqual(item["body"], "")
-            self.assertTrue(item["id"].startswith("<m"))
+            self.assertTrue(item["id"].startswith("imap:123:"))
+            self.assertTrue(item["is_read"])
 
     def test_imap_single_fetch_does_not_reload_list(self):
         fake = _FakeSingleIMAP()
@@ -158,7 +161,7 @@ class TestMailFetchOptimizations(unittest.TestCase):
         po.assert_not_called()
 
     def test_merge_incremental_reuses_cached_bodies(self):
-        # 增量刷新：已缓存的旧邮件复用其正文，新邮件才补取正文
+        # 增量刷新：旧邮件复用正文，新邮件保持元数据并按需加载正文
         acct = _FakeAccount(protocol="imap", account_id=9)
         existing = [
             {"id": "<old@e.com>", "subject": "Old", "body": "cached body",
@@ -179,11 +182,10 @@ class TestMailFetchOptimizations(unittest.TestCase):
 
         self.assertEqual(new_count, 1)
         self.assertEqual(len(merged), 2)
-        # 新邮件通过 fetch_mail_full 补取正文（仅一次）
-        fm.assert_called_once()
+        fm.assert_not_called()
         # 顺序保持服务端最新在前
         self.assertEqual(merged[0]["id"], "<new@e.com>")
-        self.assertEqual(merged[0]["body"], "new body")
+        self.assertNotIn("body", merged[0])
         # 旧邮件复用缓存中的正文，不再重新下载
         self.assertEqual(merged[1]["id"], "<old@e.com>")
         self.assertEqual(merged[1]["body"], "cached body")
@@ -201,8 +203,8 @@ class TestMailFetchOptimizations(unittest.TestCase):
                 acct, None, "inbox", 20, existing
             )
         self.assertEqual(new_count, 1)
-        fm.assert_called_once()
-        self.assertEqual(merged[0]["body"], "fresh")
+        fm.assert_not_called()
+        self.assertNotIn("body", merged[0])
         self.assertEqual(merged[1]["body"], "cached")
 
     def test_merge_incremental_pop3_reuses_ref_body(self):
